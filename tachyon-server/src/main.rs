@@ -161,8 +161,13 @@ fn run(srv: &mut server::Server, port: u16) -> Result<()> {
         loop {
             match sock.recv_from(&mut buf) {
                 Ok((n, addr)) => {
-                    if let Some(msg) = netsock::decode(&buf[..n]) {
-                        srv.on_datagram(addr, &msg);
+                    match netsock::decode(&buf[..n]) {
+                        Some(msg) => srv.on_datagram(addr, &msg),
+                        None => {
+                            if let Some(l) = &mut srv.log {
+                                l.bad_datagram(addr, &buf[..n]);
+                            }
+                        }
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,

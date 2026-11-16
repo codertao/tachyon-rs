@@ -18,7 +18,9 @@ cargo run --release -p tachyon-server -- --assets /path/to/Tachyon.pff --map DM_
 Options: `--port` (default 2766, the port the game's Network screen uses), `--name`,
 `--max-players`, `--password`, `--original-bugs`, `--log-packets <file>`, `--log-detail`.
 
-`--log-packets` writes every engine packet in and out with a hex dump. Adding `--log-detail`
+`--log-packets` writes every engine packet in and out with a hex dump, plus the Netsock session
+messages (enumerate, join, create player, leave and their replies, interpreted) and datagrams
+that fail the CRC check. Adding `--log-detail`
 also writes what each message means, under the message, and dumps bodies in full. For example:
 
 ```

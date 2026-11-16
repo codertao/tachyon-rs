@@ -191,12 +191,22 @@ impl Server {
     }
 
     fn send_raw(&mut self, addr: SocketAddr, msg: Vec<u8>) {
+        if let Some(l) = &mut self.log
+            && netsock::kind(&msg) != netsock::GAME_DATA
+        {
+            l.session(false, addr, &msg);
+        }
         self.outgoing.push((addr, msg));
     }
 
     // ---- Netsock layer ----
 
     pub fn on_datagram(&mut self, addr: SocketAddr, msg: &[u8]) {
+        if let Some(l) = &mut self.log
+            && netsock::kind(msg) != netsock::GAME_DATA
+        {
+            l.session(true, addr, msg);
+        }
         let Some(m) = netsock::parse_client(msg) else { return };
         if let Some(p) = self.peers.get_mut(&addr) {
             p.last_heard = Instant::now();
@@ -363,6 +373,9 @@ impl Server {
     fn player_joined(&mut self, addr: SocketAddr, netsock_id: u32, slot: u16, name: &str, blob: &[u8]) {
         let join = parse_join_blob(blob);
         let name = if name.is_empty() { "JAKE_LOGAN".to_string() } else { name.to_string() };
+        if let Some(l) = &mut self.log {
+            l.note(&format!("slot {slot} = {addr} ({name:?}, player id {netsock_id:#x})"));
+        }
         let kick = (join.magic != JOIN_MAGIC).then_some(5u8);
         let mut c = Conn {
             addr,
@@ -479,6 +492,9 @@ impl Server {
 
     pub fn remove_player(&mut self, slot: u16, why: &str) {
         let Some(c) = self.conns[slot as usize].take() else { return };
+        if let Some(l) = &mut self.log {
+            l.note(&format!("slot {slot} ({}) removed: {why}", c.addr));
+        }
         if let Some(p) = self.peers.get_mut(&c.addr) {
             p.player = None;
         }

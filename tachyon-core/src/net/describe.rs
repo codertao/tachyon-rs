@@ -494,6 +494,105 @@ fn event(kind: u16, b: &[u8], from_client: bool) -> Option<String> {
     Some(s)
 }
 
+/// Name and interpretation of a Netsock session message (a whole message: `u16 type, u16 len`,
+/// body), as in `multiplayer.md` "Netsock session protocol". Passwords are reported as given or
+/// not, never printed.
+pub fn session(msg: &[u8]) -> (&'static str, Vec<String>) {
+    use crate::net::netsock::{self as ns, APP_GUID};
+    use crate::net::proto::parse_join_blob;
+    let b = msg.get(4..).unwrap_or(&[]);
+    let guid = |o: usize| if b.get(o..o + 16) == Some(&APP_GUID[..]) { "Tachyon app GUID" } else { "WRONG app GUID" };
+    let hex16 = |o: usize| b.get(o..o + 16).map_or("?".into(), |g| g.iter().map(|x| format!("{x:02x}")).collect::<String>());
+    match ns::kind(msg) {
+        ns::ENUM => ("Enumerate", vec![guid(0).into()]),
+        ns::ENUM_REPLY => (
+            "EnumReply",
+            vec![
+                format!(
+                    "session {:?}: {}/{} players, flags {:#x}{}",
+                    str_at(b, 0x10),
+                    u32_at(b, 0xc),
+                    u32_at(b, 8),
+                    u32_at(b, 4),
+                    if u32_at(b, 4) & 8 != 0 { " (password)" } else { "" }
+                ),
+                format!(
+                    "session GUID {}, {}, game data {:#x} {:#x} {:#x} {:#x}",
+                    hex16(0xd0),
+                    guid(0xe0),
+                    u32_at(b, 0xf0),
+                    u32_at(b, 0xf4),
+                    u32_at(b, 0xf8),
+                    u32_at(b, 0xfc)
+                ),
+            ],
+        ),
+        ns::JOIN => (
+            "Join",
+            vec![format!("{}, {}", guid(0), if b.get(16).is_some_and(|&c| c != 0) { "password given" } else { "no password" })],
+        ),
+        ns::JOIN_REPLY => {
+            let status = match u16_at(b, 0) {
+                1 => "accepted".to_string(),
+                2 => format!(
+                    "refused ({})",
+                    match u16_at(b, 2) {
+                        1 => "wrong password",
+                        2 => "wrong app GUID",
+                        3 => "session full",
+                        _ => "unknown reason",
+                    }
+                ),
+                s => format!("status {s}"),
+            };
+            ("JoinReply", vec![format!("{status}, server id {}", id(u32_at(b, 4)))])
+        }
+        ns::CREATE_PLAYER => {
+            let mut l = vec![format!(
+                "request {}, name {:?}, {} bytes of player data",
+                u32_at(b, 0),
+                str_at(b, 4),
+                u32_at(b, 0x88)
+            )];
+            if let Some(data) = b.get(0x9c..) {
+                let j = parse_join_blob(data);
+                let mounts: Vec<String> =
+                    j.mounts.iter().enumerate().filter(|(_, w)| **w != 0).map(|(i, w)| format!("{i}:w{}", w - 1)).collect();
+                l.push(format!(
+                    "join blob: deathmatch ship {:?} as {}; team ships {:?}/{:?}, preferred team {}",
+                    j.dm_ship,
+                    race(j.dm_team),
+                    j.galspan_ship,
+                    j.bora_ship,
+                    j.preferred_team
+                ));
+                l.push(format!(
+                    "portrait {:?}, systems {:#x}, mounts {}, voice port {}, game id {}, magic {:#x}",
+                    j.portrait,
+                    j.systems,
+                    list(mounts.into_iter()),
+                    j.voice_port,
+                    j.game_id,
+                    j.magic
+                ));
+            }
+            ("CreatePlayer", l)
+        }
+        ns::CREATE_REPLY => (
+            "CreateReply",
+            vec![format!("{}, player id {}", if u32_at(b, 0) == 0 { "ok" } else { "failed" }, id(u32_at(b, 4)))],
+        ),
+        ns::DESTROY_PLAYER => ("DestroyPlayer", vec![format!("player id {}", id(u32_at(b, 0)))]),
+        ns::DESTROY_REPLY => ("DestroyReply", vec![format!("result {}", u32_at(b, 0))]),
+        ns::CLOSE => ("Close", vec![]),
+        ns::CLOSE_REPLY => ("CloseReply", vec![format!("result {}", u32_at(b, 0))]),
+        ns::SERVER_CLOSING => ("ServerClosing", vec![]),
+        0x1012 => ("NovaWorldPing", vec![]),
+        ns::GAME_DATA => ("GameData", vec![]),
+        _ => ("?", vec![]),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +607,13 @@ mod tests {
         let l = describe(MSG_PLAYERDATA, &body, true);
         assert!(l.iter().any(|x| x.contains("ship at (100, -5, 7)")), "{l:?}");
         // Every kind on short or empty bodies: no panic.
+        for k in 0x1000..0x1090u16 {
+            for n in [0, 3, 4, 20, 0x60] {
+                let mut m = k.to_le_bytes().to_vec();
+                m.resize(n.max(2), 0xff);
+                let _ = session(&m);
+            }
+        }
         for k in (0..0x130u16).chain(0x1000..0x1130).chain(0x2000..0x2030) {
             for n in [0, 1, 7, 40] {
                 let _ = describe(k, &vec![0xff; n], k >= 0x2000);
