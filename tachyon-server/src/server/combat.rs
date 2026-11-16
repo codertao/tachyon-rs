@@ -189,10 +189,6 @@ impl Server {
         let Some(target) = self.world.get(h.target) else { return };
         let target_pos = target.pos;
         let Some(def) = weapons::by_id(h.weapon) else { return };
-        if h.part.is_some() {
-            // Capital ship / station parts (`CapShip_DamagePartById`) arrive with the part
-            // entities (starbases and M4 turrets). Until then only the impact plays.
-        }
         let amount = ((def.damage as i64 * h.scale as i64) >> 16) as i32;
         if self.opts.debug_damage {
             println!(
@@ -219,7 +215,14 @@ impl Server {
         };
         // The impact excludes the shooter, unless a surviving player victim took the hit, in
         // which case `TachSrv_DamagePlayer` re-staged the exclusion to the victim.
-        let except = if h.part.is_none() { self.damage_entity(h.target, &d).unwrap_or(slot) } else { slot };
+        let except = match h.part {
+            None => self.damage_entity(h.target, &d).unwrap_or(slot),
+            // `TachSrv_OnPartHitReport` → `CapShip_DamagePartById`.
+            Some(part) => {
+                self.damage_base_part(h.target, part, &d, slot);
+                slot
+            }
+        };
         self.play_impact(h.weapon, h.kind, h.pos, target_pos, except);
     }
 
@@ -334,7 +337,7 @@ impl Server {
 
     /// The weapon's impact callback on the server (`Impact_Bolt`): kind 1 (shield) sends the
     /// spark 0x1004, anything else a small explosion 0x1003 effect 0. Collisions have none.
-    fn play_impact(&mut self, weapon: u8, kind: u8, hit_pos: [i32; 3], target_pos: [i32; 3], except: u16) {
+    pub(super) fn play_impact(&mut self, weapon: u8, kind: u8, hit_pos: [i32; 3], target_pos: [i32; 3], except: u16) {
         if weapon == WEAPON_COLLISION {
             return;
         }
@@ -544,6 +547,10 @@ impl Server {
             return;
         }
         let ship = c.ship;
+        // The other entity's desc `+0x70` hook replaces the collision (powerups: pickup).
+        if other != 0 && self.touch_pickup(slot, other) {
+            return;
+        }
         let original = self.opts.original_bugs;
         let Some(e) = self.world.get_mut(ship) else { return };
         if e.power.hull <= 0 {

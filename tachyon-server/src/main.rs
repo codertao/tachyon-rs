@@ -28,6 +28,7 @@ options:
   --password <s>        session password
   --max-kills <n>       Deathmatch kill limit that ends the round (default 20, 0 = none)
   --time-limit <min>    round length in minutes (default 30, 0 = untimed)
+  --no-powerups         Deathmatch POWERUPS option off (credit crystals still spawn)
   --debug-damage        print each hit's damage calculation and the front/rear shield and hull
                         changes (toggle at runtime with /debug damage)
   --original-bugs       reproduce the original host's known bugs (see DEVIATIONS.md)
@@ -50,6 +51,7 @@ pub struct Args {
     pub password: String,
     pub original_bugs: bool,
     pub debug_damage: bool,
+    pub no_powerups: bool,
     pub max_kills: u32,
     pub time_limit: u32,
     pub log_packets: Option<PathBuf>,
@@ -68,6 +70,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args> {
         password: String::new(),
         original_bugs: false,
         debug_damage: false,
+        no_powerups: false,
         max_kills: 20,
         time_limit: 30,
         log_packets: None,
@@ -87,6 +90,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args> {
             "--password" => a.password = val()?,
             "--original-bugs" => a.original_bugs = true,
             "--debug-damage" => a.debug_damage = true,
+            "--no-powerups" => a.no_powerups = true,
             "--max-kills" => a.max_kills = val()?.parse().context("--max-kills")?,
             "--time-limit" => a.time_limit = val()?.parse().context("--time-limit")?,
             "--log-packets" => a.log_packets = Some(PathBuf::from(val()?)),
@@ -156,6 +160,7 @@ fn main() -> Result<()> {
         max_kills: args.max_kills,
         time_limit_min: args.time_limit,
         debug_damage: args.debug_damage,
+        powerups: !args.no_powerups,
     };
     let mut srv = server::Server::new(opts, map, log);
     run(&mut srv, args.port)

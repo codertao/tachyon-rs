@@ -22,12 +22,31 @@ pub struct Placement {
     /// Kind 3 only: index into `Spx::group_names` (-1 = none). The engine maps the name through
     /// SHIPTEXT.BIN to the id triggers use (`Spx_RemapPlacementNames 0x434f10`); see `FlightGroups`.
     pub group: i32,
+    /// Raw words at +0x38 and +0x3c (0 when the record is shorter). Kind 4 (powerups): respawn
+    /// seconds and position jitter (`Powerup_Spawn 0x456680`, `Powerup_PickPosition`). Kind 3
+    /// starbases: +0x38 low byte = team + 1, 0 = the `.des` race (`BasePart_Spawn 0x40a620`).
+    pub extra: [u32; 2],
     /// Render scale. Asteroids (kind 2) carry a 16.16 scale at +0x38
     /// (`Asteroid_SpawnAtLoad 0x407f30` copies it to the entity's scale); everything else is 1.
     pub scale: f32,
+    /// The whole record, for type-specific fields (gates: destination `.spx` at +0x38, mission
+    /// variable refs at +0x3c/+0x48/+0x50, regional flag +0x58; mines: +0x54/+0x60).
+    pub raw: Vec<u8>,
 }
 
 impl Placement {
+    /// Little-endian u16 / u32 of the raw record at `o` (0 past its end).
+    pub fn u16_at(&self, o: usize) -> u16 {
+        self.raw.get(o..o + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
+    }
+    pub fn u32_at(&self, o: usize) -> u32 {
+        self.raw.get(o..o + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
+    }
+    /// NUL-terminated string of at most `max` bytes at `o`.
+    pub fn str_at(&self, o: usize, max: usize) -> String {
+        cstr(&self.raw, o, max)
+    }
+
     /// Kind-3 objects with flag 0x8 aren't spawned at sector load (`Ship_SpawnAtLoad 0x434e80`
     /// and its siblings); a trigger spawns them later. (0x1000 marks the kind-0 marker records,
     /// which are never built.)
@@ -91,6 +110,8 @@ pub fn parse(d: &[u8]) -> Result<Spx> {
             flags: u32_(o + 0x24)?,
             group: if kind == 3 && size >= 0x58 { i32_(o + 0x54)? } else { -1 },
             scale: if kind == 2 && size >= 0x3c { fx(0x38)? } else { 1.0 },
+            extra: [if size >= 0x3c { u32_(o + 0x38)? } else { 0 }, if size >= 0x40 { u32_(o + 0x3c)? } else { 0 }],
+            raw: d.get(o..o + size).unwrap_or(&[]).to_vec(),
         });
         if size == 0 {
             break;

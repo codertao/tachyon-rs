@@ -469,9 +469,19 @@ impl Bot {
             0x1114 => self.world.set_team(u32_at(b, 0), u16_at(b, 4) as u8),
             0x1005 => self.world.log("we took damage"),
             0x1100 => {
-                let slot = if b.get(6) == Some(&1) { format!(", player slot {} ({})", u16_at(b, 0xa), self.world.roster.get(&u16_at(b, 0xa)).map_or("not in roster", |s| s.as_str())) } else { String::new() };
-                self.world.log(format!("CLASS INFO {:#010x}: desc slot {}, type {}{slot}", u32_at(b, 0), u16_at(b, 4), b.get(6).copied().unwrap_or(0)));
+                // The layout depends on the class: 6 bytes plain (powerups), 16 for ships
+                // (type @6, roster slot @0xa), 0x10 + 2n for starbases (part @6, dock @8,
+                // n removed @0xc).
+                let what = match b.len() {
+                    6 => String::new(),
+                    16 if b.get(6) == Some(&1) => format!(", player slot {} ({})", u16_at(b, 0xa), self.world.roster.get(&u16_at(b, 0xa)).map_or("not in roster", |s| s.as_str())),
+                    n if n >= 0x10 && (n - 0x10) == 2 * u32_at(b, 0xc) as usize => format!(", starbase part {} dock {} removed {:?}", u16_at(b, 6), u16_at(b, 8), (0..u32_at(b, 0xc) as usize).map(|i| u16_at(b, 0x10 + 2 * i)).collect::<Vec<_>>()),
+                    n => format!(", {n} bytes"),
+                };
+                self.world.log(format!("CLASS INFO {:#010x}: desc slot {}{what}", u32_at(b, 0), u16_at(b, 4)));
             }
+            0x1117 => self.world.log(format!("RESUPPLY type {} amount {}", u16_at(b, 0), u32_at(b, 2))),
+            0x1126 => self.world.log(format!("PART DESTROYED {:#010x} part {}", u32_at(b, 0), u16_at(b, 4))),
             0x1006 => {
                 self.world.log("WE WERE DESTROYED");
                 if self.respawn_delay > 0.0 {

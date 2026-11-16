@@ -3,6 +3,7 @@
 //! References: `decomp/notes/multiplayer.md`, especially "Server-side startup details".
 
 mod combat;
+mod objects;
 mod rules;
 
 use crate::map::Map;
@@ -54,6 +55,8 @@ pub struct Options {
     /// Print every damage calculation and shield change to the console (`--debug-damage`,
     /// console `/debug damage`).
     pub debug_damage: bool,
+    /// Deathmatch POWERUPS option (`spacesav[0x5a]`, default on): off spawns credit crystals only.
+    pub powerups: bool,
 }
 
 /// Delivery spec (`NetSrv_QueueEvent`; filter `Tach_SrvEventFilter 0x4620b0`).
@@ -159,6 +162,14 @@ pub struct Server {
     /// Round timer and between-rounds freeze, in ticks (`DAT_005b2824` / `DAT_005b2820`).
     pub round_ticks: u32,
     pub freeze_ticks: u32,
+    /// Starbase roots → their parts (`objects.rs`).
+    pub bases: HashMap<u32, objects::Base>,
+    /// Powerup entities.
+    pub pickups: HashMap<u32, objects::Pickup>,
+    /// Part offsets per OCF file, computed once.
+    part_offsets: HashMap<String, Vec<[f32; 3]>>,
+    /// Class info after `{id, descSlot}` for gates, beacons, mines and speed rings.
+    pub class_tails: HashMap<u32, Vec<u8>>,
 }
 
 fn now_seed() -> u64 {
@@ -187,6 +198,10 @@ impl Server {
             rng: seed,
             round_ticks: 0,
             freeze_ticks: 0,
+            bases: HashMap::new(),
+            pickups: HashMap::new(),
+            part_offsets: HashMap::new(),
+            class_tails: HashMap::new(),
         };
         s.load_world();
         s.start_round_timer();
@@ -214,9 +229,9 @@ impl Server {
         self.spawn_statics();
     }
 
-    /// The SPX placements the host builds as entities. So far: asteroids (`Asteroid_SpawnAtLoad`:
-    /// net flags 7, hitpoints = int(scale) x `HITPOINTS`). Starbases (OCF part entities) and
-    /// powerups follow.
+    /// The SPX placements the host builds as entities: asteroids (`Asteroid_SpawnAtLoad`: net
+    /// flags 7, hitpoints = int(scale) x `HITPOINTS`), starbases, powerups, and gates, beacons,
+    /// mines and speed rings (drawn only; `objects.rs`). SPX ships aren't built yet.
     fn spawn_statics(&mut self) {
         let placements = self.map.spx.placements.clone();
         for p in placements {
@@ -224,8 +239,21 @@ impl Server {
                 continue;
             }
             let Some(des) = self.map.des_for(p.decl).cloned() else { continue };
-            if des.desc_type != "ASTEROID" {
-                continue;
+            match des.desc_type.as_str() {
+                "ASTEROID" => {}
+                "STARBASE" => {
+                    self.spawn_starbase(&p, des);
+                    continue;
+                }
+                "POWERUP" => {
+                    self.spawn_powerup(&p, des);
+                    continue;
+                }
+                "HYPER_GATE" | "BEACON" | "MINE" | "SPEED_RING" => {
+                    self.spawn_marker(&p, des);
+                    continue;
+                }
+                _ => continue,
             }
             let Some((desc_slot, model)) = self.world.tables.add_des(&des) else { continue };
             let scale = (p.scale * 65536.0) as i32;
@@ -262,12 +290,21 @@ impl Server {
         for id in statics {
             self.world.remove(id);
         }
+        self.bases.clear();
+        self.pickups.clear();
+        self.class_tails.clear();
         self.spawn_statics();
     }
 
     /// Remove a static and blank it in every static list (`Srv_NotifyEntityRemoved`).
     fn remove_static(&mut self, id: u32) {
         self.world.remove(id);
+        self.hide_static(id);
+    }
+
+    /// Blank a static in every connection's static list (`Srv_BroadcastToQuadrant`), so pages
+    /// still to come skip it.
+    fn hide_static(&mut self, id: u32) {
         for c in self.conns.iter_mut().flatten() {
             for e in c.static_list.iter_mut().filter(|e| **e == id) {
                 *e = 0;
@@ -759,9 +796,11 @@ impl Server {
     /// invisible.
     fn on_class_info_req(&mut self, slot: u16, b: &[u8]) {
         let id = proto::u32_at(b, 0);
+        if self.object_class_info(slot, id) {
+            return;
+        }
         let Some(e) = self.world.get(id) else { return };
-        // Player ships (`LAB_00463690`, desc +0x24 of SHIP). Other classes come with their
-        // entities (starbase parts, AI ships).
+        // Player ships (`LAB_00463690`, desc +0x24 of SHIP). AI ships come in M5.
         let Owner::Player(owner) = e.owner else { return };
         let body = ev::class_info_player(id, e.desc_slot, owner);
         self.queue(ev::EV_CLASS_INFO, body, Delivery::only(slot));
@@ -887,6 +926,7 @@ impl Server {
     pub fn tick(&mut self) {
         self.round_tick();
         self.regen();
+        self.pickups_tick();
         // Per-player think: smoothing filter.
         let ids: Vec<u32> = self.world.order.clone();
         for id in ids {
@@ -1156,7 +1196,7 @@ mod tests {
         let src = AssetSource::open(std::path::Path::new("../../pff")).ok()?;
         let cfg = tachyon_core::mpc::find(&src, map).ok()?;
         let map = Map::load(src, cfg).ok()?;
-        Some(Server::new(Options { name: "t".into(), password: String::new(), max_players: 8, original_bugs: false, max_kills: 20, time_limit_min: 30, debug_damage: false }, map, None))
+        Some(Server::new(Options { name: "t".into(), password: String::new(), max_players: 8, original_bugs: false, max_kills: 20, time_limit_min: 30, debug_damage: false, powerups: true }, map, None))
     }
 
     /// A scripted client: acks startup stages, static pages and 0x1007, sends PLAYERDATA at
@@ -1425,6 +1465,127 @@ mod tests {
         assert!(texts.iter().any(|t| t == "5 MINUTES LEFT IN THIS ROUND"), "{texts:?}");
     }
 
+    /// DM_01's three starbases: a root record with state flag 0x04 in the static pages, the
+    /// 0x1100 base layout, and a damageable part (casarray's TYPE 12 comm array) destroyed by
+    /// part hit reports (0x1003 effect 3, 0x1126, then listed as removed).
+    #[test]
+    fn starbases_parts_and_class_info() {
+        let Some(mut h) = Harness::new("DM_01", 1) else { return };
+        h.run(16 * 10);
+        assert_eq!(h.s.bases.len(), 3);
+        let roots: Vec<u32> = h.s.bases.keys().copied().collect();
+        for r in &roots {
+            let e = h.s.world.get(*r).unwrap();
+            assert_eq!((e.state_flags & 4, e.net_flags), (4, 3));
+        }
+        // Ids are reserved for every part: nothing else lands inside a base's block.
+        for (r, b) in &h.s.bases {
+            let end = r + 2 * b.parts.len() as u32;
+            assert!(h.s.world.entities.keys().all(|id| id == r || *id < *r || *id >= end));
+        }
+        let (root, part) = h
+            .s
+            .bases
+            .iter()
+            .find_map(|(r, b)| b.parts.iter().find(|p| p.flags & 0x800 != 0).map(|p| (*r, p.index)))
+            .expect("casarray has a TYPE 12 part");
+        h.c[0].out.push((ev::CL_CLASS_INFO, root.to_le_bytes().to_vec()));
+        h.run(32);
+        let info = h.got(0, ev::EV_CLASS_INFO);
+        let desc = h.s.world.get(root).unwrap().desc_slot;
+        assert_eq!(info.last().unwrap().as_slice(), ev::class_info_base(root, desc, 0, 0, &[]).as_slice());
+        // A hull part can't be damaged.
+        let root_pos = h.s.world.get(root).unwrap().pos;
+        let hit = |part: u16| ev::hit(&ev::Hit { pos: root_pos, target: root, weapon: 2, kind: 2, scale: 0x10000, part: Some(part) });
+        let hull_hit = hit(0);
+        h.c[0].out.push((ev::CL_PART_HIT, hull_hit));
+        h.run(16);
+        assert!(h.s.bases[&root].parts[0].alive);
+        // Fly to the part so its explosion (radius 1000) reaches us.
+        h.c[0].pos = h.s.bases[&root].parts[part as usize].pos;
+        h.run(32);
+        // Heavy laser: 7500 x 153/256 = 4482 a hit against 20000 hp -> 5 hits.
+        for _ in 0..5 {
+            let b = hit(part);
+            h.c[0].out.push((ev::CL_PART_HIT, b));
+        }
+        h.run(32);
+        assert!(!h.s.bases[&root].parts[part as usize].alive);
+        assert_eq!(h.got(0, ev::EV_SUBPART_DESTROY), vec![&ev::subpart_destroy(root, part)]);
+        assert!(h.got(0, ev::EV_DESTROYED).iter().any(|b| b[0x14] == 3));
+        h.c[0].out.push((ev::CL_CLASS_INFO, root.to_le_bytes().to_vec()));
+        h.run(32);
+        assert_eq!(h.got(0, ev::EV_CLASS_INFO).last().unwrap().as_slice(), ev::class_info_base(root, desc, 0, 0, &[part]).as_slice());
+    }
+
+    /// Powerups: a full-shield ship doesn't use a shield powerup; a damaged one does (text,
+    /// 0x1117, 0x1011, no collision damage), and it comes back after its delay with 0x1106.
+    #[test]
+    fn powerups_pickup_and_respawn() {
+        let Some(mut h) = Harness::new("DM_01", 1) else { return };
+        assert_eq!(h.s.pickups.len(), 43);
+        h.run(16 * 10);
+        let (id, pk) = h.s.pickups.iter().find(|(_, p)| p.kind == objects::PUP_SHIELDS).map(|(i, p)| (*i, p.clone())).unwrap();
+        assert_eq!(pk.respawn, 60 * 50);
+        let touch = |id: u32| ev::collision(500, id);
+        h.c[0].out.push((ev::CL_COLLISION, touch(id)));
+        h.run(32);
+        assert!(!h.s.pickups[&id].taken(), "full shields still took it");
+        let ship = h.ship(0);
+        let hull = h.s.world.get(ship).unwrap().power.hull;
+        h.s.world.get_mut(ship).unwrap().power.shield_front = 100;
+        h.c[0].out.push((ev::CL_COLLISION, touch(id)));
+        h.run(32);
+        assert!(h.s.pickups[&id].taken());
+        let p = h.s.world.get(ship).unwrap().power;
+        assert_eq!((p.shield_front, p.hull), ((100 + pk.amount).min(p.shield_max), hull), "touching a powerup did damage");
+        assert_eq!(h.got(0, ev::EV_RESUPPLY), vec![&ev::resupply(1, pk.amount as u32)]);
+        assert!(h.got(0, ev::EV_TEXT).iter().any(|b| ev::parse_text(b).2 == "SHIELDS REPLENISHED"));
+        assert_eq!(h.got(0, ev::EV_DESPAWN), vec![&ev::despawn(id)]);
+        // Taken: a second touch does nothing; it's back after 60 s.
+        h.c[0].out.push((ev::CL_COLLISION, touch(id)));
+        h.run(60 * 50 + 32);
+        assert_eq!(h.got(0, ev::EV_RESUPPLY).len(), 1);
+        assert!(!h.s.pickups[&id].taken());
+        let spawn = h.got(0, ev::EV_SPAWN_ENTITY);
+        assert_eq!(spawn.len(), 1);
+        assert_eq!(proto::u32_at(spawn[0], 0), id);
+        assert_eq!(spawn[0].len(), 0x28);
+    }
+
+    /// Gates, mines, beacons and speed rings exist with the original's state flags and answer
+    /// 0x2002 with their class info (sizes 0x24 / 0xc / 8 / 0xc).
+    #[test]
+    fn markers_spawn_with_class_info() {
+        let cases: [(&str, &str, usize, usize, u8); 4] =
+            [("BW_02", "HYPER_GATE", 2, 0x24, 0x45), ("BW_02", "MINE", 8, 0xc, 5), ("DM_04", "BEACON", 1, 8, 5), ("basewar1", "SPEED_RING", 6, 0xc, 4)];
+        for (map, kind, count, size, flags) in cases {
+            let Some(mut h) = Harness::new(map, 1) else { return };
+            h.run(16 * 10);
+            let ids: Vec<u32> = h.s.world.order.iter().copied().filter(|id| h.s.world.get(*id).is_some_and(|e| e.des.desc_type == kind)).collect();
+            assert_eq!(ids.len(), count, "{map} {kind}");
+            for &id in &ids {
+                let e = h.s.world.get(id).unwrap();
+                assert_eq!((e.state_flags, e.net_flags), (flags, 3), "{map} {kind}");
+                h.c[0].out.push((ev::CL_CLASS_INFO, id.to_le_bytes().to_vec()));
+            }
+            h.run(32);
+            let infos = h.got(0, ev::EV_CLASS_INFO);
+            for &id in &ids {
+                let b = infos.iter().find(|b| proto::u32_at(b, 0) == id).unwrap_or_else(|| panic!("{map} {kind}: no class info"));
+                assert_eq!(b.len(), size, "{map} {kind}");
+                if kind == "HYPER_GATE" {
+                    let name: String = b[0xc..].iter().take_while(|&&c| c != 0).map(|&c| c as char).collect();
+                    println!("{map} gate {id:#x}: open {} sector {} flags {} name {name:?}", proto::u16_at(b, 6), proto::u16_at(b, 8), proto::u16_at(b, 10));
+                    assert!(!name.is_empty());
+                }
+                if kind == "SPEED_RING" {
+                    assert_eq!(proto::u32_at(b, 8), 245_760); // SPEED_BOOST 1500 x 163.84
+                }
+            }
+        }
+    }
+
     /// Asteroids reach clients as static pages: 4 extended records per snapshot (12 while
     /// loading), repeated until acked, nearest first, with the descriptor slot.
     #[test]
@@ -1435,7 +1596,11 @@ mod tests {
         h.run(16 * 40);
         let paged: Vec<_> = h.c[0].snaps.iter().flat_map(|s| s.records.iter()).filter(|r| r.flags & proto::REC_PAGED != 0).collect();
         assert!(paged.len() >= 4 * 20, "{}", paged.len());
-        assert!(paged.iter().all(|r| r.desc.is_some_and(|d| d >= 0)));
+        let asteroid = |id: u32| h.s.world.get(id).is_some_and(|e| e.des.desc_type == "ASTEROID");
+        assert!(paged.iter().filter(|r| asteroid(r.id)).all(|r| r.desc.is_some_and(|d| d >= 0)));
+        // Starbases and powerups go in the pages too, without a descriptor (net flag 4 clear).
+        let odd: Vec<_> = paged.iter().filter(|r| !asteroid(r.id) && !(r.desc.is_none() && r.flags & 4 != 0)).map(|r| (r.id, r.desc, r.flags, h.s.world.get(r.id).map(|e| e.des.desc_type.clone()))).collect();
+        assert!(odd.is_empty(), "{odd:?}");
         assert!(h.c[0].snaps.iter().all(|s| s.page_count <= 4));
         let c = h.conn(0);
         assert!(c.static_acked >= 4 * 20 && c.static_acked < total, "{}", c.static_acked);

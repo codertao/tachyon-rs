@@ -31,6 +31,56 @@ pub fn ammo(mount: u16, count: u16) -> Vec<u8> {
     b
 }
 pub const EV_CLASS_INFO: u16 = 0x1100;
+pub const EV_SPAWN_ENTITY: u16 = 0x1106;
+pub const EV_RESUPPLY: u16 = 0x1117;
+pub const EV_SUBPART_DESTROY: u16 = 0x1126;
+
+/// 0x1100 for classes whose writer (desc `+0x24`) adds nothing: `{u32 id, u16 descSlot}`
+/// (`SrvSend_EntityClassInfo` alone, e.g. `Powerup_GetType`).
+pub fn class_info_plain(id: u32, desc_slot: u16) -> Vec<u8> {
+    let mut b = id.to_le_bytes().to_vec();
+    b.extend_from_slice(&desc_slot.to_le_bytes());
+    b
+}
+
+/// 0x1100 for a starbase root (`LAB_0040b3e0`): `{u32 id, u16 descSlot, u16 partIndex @6,
+/// u16 dockState @8, u16 0, u32 nRemoved @0xc, u16 removed[n]}`. The client
+/// (`Base_InitClientParts`) builds every OCF part except the removed ones.
+pub fn class_info_base(id: u32, desc_slot: u16, part: u16, dock_state: u16, removed: &[u16]) -> Vec<u8> {
+    let mut b = class_info_plain(id, desc_slot);
+    b.extend_from_slice(&part.to_le_bytes());
+    b.extend_from_slice(&dock_state.to_le_bytes());
+    b.extend_from_slice(&[0, 0]);
+    b.extend_from_slice(&(removed.len() as u32).to_le_bytes());
+    for r in removed {
+        b.extend_from_slice(&r.to_le_bytes());
+    }
+    b
+}
+
+/// 0x1106 `{extended record (origin = the entity's own position) [0x1c], vec3 pos @0x1c}`
+/// (`SrvSend_SpawnEntity`; the client builds the replica unless it already has the id).
+pub fn spawn_entity(record: &[u8], pos: [i32; 3]) -> Vec<u8> {
+    let mut b = record.to_vec();
+    b.resize(0x1c, 0);
+    put_vec(&mut b, pos);
+    b
+}
+
+/// 0x1126 `{u32 rootId, u16 partIndex}` (`SrvSend_SubpartDestroy`).
+pub fn subpart_destroy(root: u32, part: u16) -> Vec<u8> {
+    let mut b = root.to_le_bytes().to_vec();
+    b.extend_from_slice(&part.to_le_bytes());
+    b
+}
+
+/// 0x1117 `{u16 powerupType, u32 amount}` (`SrvSend_ResupplyNotice`). The client plays the
+/// pickup sound and adds laser/burner energy itself (`Resupply_ApplyNotice`).
+pub fn resupply(kind: u16, amount: u32) -> Vec<u8> {
+    let mut b = kind.to_le_bytes().to_vec();
+    b.extend_from_slice(&amount.to_le_bytes());
+    b
+}
 pub const EV_ROUND_FREEZE: u16 = 0x1119;
 pub const EV_ROUND_RESUME: u16 = 0x1120;
 

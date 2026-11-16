@@ -20,9 +20,34 @@ pub struct Tables {
     desc_idx: HashMap<String, (u16, Option<u8>)>,
 }
 
+/// The projectile models every flight loads into `g_ObjModelPool` first
+/// (`Flight_LoadCommonAssets` → `Weapons_LoadModels`, list `0x559fc0`: torpedoes, missiles,
+/// Helios rocket, mines/sappers), so they hold slots 0..12 on the host and on every client. The
+/// client's `ModelPool_SetSlot` ignores a table entry for a slot it already filled, so a server
+/// that put its own models there would see them drawn as these weapons.
+pub const WEAPON_POOL_MODELS: [(&str, &str); 13] = [
+    ("torpseco.pak", "torpedos.pal"),
+    ("torpshld.pak", "torpedos.pal"),
+    ("torpblst.pak", "torpedos.pal"),
+    ("torpabst.pak", "torpedos.pal"),
+    ("misstigr.pak", "missiles.pal"),
+    ("misshevy.pak", "missiles.pal"),
+    ("missdisb.pak", "missiles.pal"),
+    ("missswrm.pak", "missiles.pal"),
+    ("rokthlos.pak", "missiles.pal"),
+    ("mineremt.pak", "weapmine.pal"),
+    ("mineinrt.pak", "weapmine.pal"),
+    ("minepwer.pak", "weapmine.pal"),
+    ("mineshld.pak", "weapmine.pal"),
+];
+
 impl Tables {
     pub fn new() -> Self {
-        Tables { models: vec![None; 256], descs: vec![None; 256], ..Default::default() }
+        let mut t = Tables { models: vec![None; 256], descs: vec![None; 256], ..Default::default() };
+        for (pak, pal) in WEAPON_POOL_MODELS {
+            t.add_model(pak, pal);
+        }
+        t
     }
 
     /// Register a descriptor (and its pool model) like `Desc_CreateByType`; returns
@@ -218,6 +243,15 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The weapon models keep slots 0..12, so the first map model lands at 13.
+    #[test]
+    fn weapon_models_reserve_the_first_slots() {
+        let mut t = Tables::new();
+        assert_eq!(t.models[10].as_ref().map(|m| m.0.as_str()), Some("mineinrt.pak"));
+        assert_eq!(t.add_model("ast1.pak", "rock.pal"), Some(13));
+        assert_eq!(t.add_model("MISSTIGR.PAK", "missiles.pal"), Some(4));
+    }
 
     #[test]
     fn smoothing_converges_and_wraps() {

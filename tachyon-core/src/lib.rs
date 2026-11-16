@@ -12,6 +12,7 @@ pub mod ocf;
 pub mod pak;
 pub mod pff;
 pub mod race;
+pub mod rtxt;
 pub mod source;
 pub mod spx;
 pub mod weapons;

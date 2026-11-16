@@ -8,9 +8,14 @@ Status: **M2 in progress (PvP Deathmatch)**. Players join, load, fly, see each o
 leave (M1). Combat follows the stock host: shots are relayed, hit reports drain shields and hull,
 kills are credited with the original kill lines, players respawn, shields regenerate and power
 transfers work; collisions hurt both sides. Rounds end at the kill limit or time limit, freeze
-for 10 s and restart (ammo refilled). Asteroids are built from the map and sent the way the stock host sends
-them. Still missing from M2: starbases (station part entities) and powerups. Turrets, server
-missiles, AI pilots and Base Wars rules come in later milestones (see the plan).
+for 10 s and restart (ammo refilled). Asteroids, starbases and powerups are built from the map and sent the way
+the stock host sends them. Starbase subsystems (generators, comm arrays) can be shot off; hull
+sections can't. Powerups are picked up by flying into them and come back after the map's delay
+(60 s on the stock maps). Hyperspace gates, beacons, mines and speed rings are drawn, but gates
+don't take you anywhere and mines don't explode yet (speed rings are run by the client and
+may already work). Not built yet: SPX ships; credit crystals spawn but can't be picked up until
+Base Wars credits exist. Turrets, server missiles,
+AI pilots and Base Wars rules come in later milestones (see the plan).
 Deliberate differences from the original host: `DEVIATIONS.md`.
 
 ## Running
@@ -22,9 +27,11 @@ cargo run --release -p tachyon-server -- --assets /path/to/Tachyon.pff --map DM_
 
 Options: `--port` (default 2766, the port the game's Network screen uses), `--name`,
 `--max-players`, `--password`, `--max-kills <n>` (Deathmatch kill limit, default 20, 0 = none),
-`--time-limit <minutes>` (round length, default 30, 0 = untimed), `--debug-damage` (print each
+`--time-limit <minutes>` (round length, default 30, 0 = untimed), `--no-powerups` (the
+Deathmatch POWERUPS option off), `--debug-damage` (print each
 hit's damage calculation, how it splits between front and rear shields, and the shield and hull
-values before and after; also collisions and power transfers. Toggle at runtime with the console
+values before and after; also collisions, power transfers, starbase part damage and powerup
+pickups. Toggle at runtime with the console
 command `/debug damage [on|off]`), `--original-bugs`,
 `--log-packets <file>`, `--log-detail`.
 

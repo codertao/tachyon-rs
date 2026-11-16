@@ -71,13 +71,13 @@ impl Server {
         let t = self.round_ticks;
         let due = if self.opts.original_bugs {
             let m = t / TICKS_PER_MINUTE;
-            m > 4 && m % TICKS_PER_MINUTE == 0
+            m > 4 && m.is_multiple_of(TICKS_PER_MINUTE)
         } else {
-            t != 0 && t % TICKS_PER_MINUTE == 0 && t / TICKS_PER_MINUTE > 4
+            t != 0 && t.is_multiple_of(TICKS_PER_MINUTE) && t / TICKS_PER_MINUTE > 4
         };
         if due {
-            // Colour: the `DAT_005a6320` table's byte 1, which is filled at run time; info
-            // colour assumed.
+            // Colour: `DAT_005a6320` byte 1, and `Gfx_DefineColor` stores colour i at
+            // `0x5a6320 + i`, so colour 1 (info).
             let text = format!("{} MINUTES LEFT IN THIS ROUND", t / TICKS_PER_MINUTE);
             self.text_to(Delivery::all(), ev::COLOR_INFO, &text);
         }

@@ -19,6 +19,7 @@ behaviour where that is practical.
 | Round timer | Keeps counting through a kill-limit freeze; if it runs out then, the round is frozen a second time | Paused during the freeze | restores |
 | Minutes left | `DM_MsgMinutesLeft` tests minutes % 3000 instead of ticks % 3000, so "%d MINUTES LEFT IN THIS ROUND" never appears | Announced on each whole minute while 5 or more minutes are left (the evident intent) | restores (silent) |
 | Round freeze | 1000 ticks (20 s) between rounds | 500 ticks (10 s), at the user's request | restores |
+| Starbase record model | The root's model byte is its slot in the client's base pak pool, which the client looks up in the object model pool until the class info arrives, so a wrong model shows for a moment | Model 0 (also a placeholder) | no |
 | Spawn pitch | `Vec_DirAngles(pos, origin)` also pitches the nose toward the origin | Same yaw (checked against `Math_Atan2Core`), pitch 0; the client owns its pose from then on | no |
 
 Further fixes are proposed to the user before they are added.
