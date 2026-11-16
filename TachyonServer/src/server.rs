@@ -122,9 +122,7 @@ pub struct Server {
     pub world: World,
     pub conns: Vec<Option<Conn>>,
     peers: HashMap<SocketAddr, Peer>,
-    next_netsock_id: u32,
     session: u32,
-    session_guid: [u8; 16],
     pub game_frame: u32,
     net_tick: u32,
     portraits: Vec<String>,
@@ -148,9 +146,7 @@ impl Server {
             world: World::new(),
             conns: (0..slots).map(|_| None).collect(),
             peers: HashMap::new(),
-            next_netsock_id: 1,
             session: (seed as u32 & 0xffff) | 1,
-            session_guid: std::array::from_fn(|i| (seed >> ((i % 8) * 8)) as u8 ^ i as u8),
             game_frame: 0,
             net_tick: 100,
             portraits: vec![],
@@ -188,7 +184,10 @@ impl Server {
     }
 
     fn session_record(&self) -> Vec<u8> {
-        netsock::session_record(&self.opts.name, self.conns.len() as u32, self.player_count() as u32, !self.opts.password.is_empty(), self.session_guid)
+        netsock::session_record(&self.opts.name, self.conns.len() as u32, self.player_count() as u32, !self.opts.password.is_empty(),
+            // The stock host leaves the session GUID zero, and the NovaWorld join path
+            // (`NwLaunch_JoinSession`) looks the session up by an all-zero GUID.
+            [0; 16])
     }
 
     fn send_raw(&mut self, addr: SocketAddr, msg: Vec<u8>) {
@@ -222,10 +221,10 @@ impl Server {
                     None
                 };
                 match refuse {
-                    Some(r) => self.send_raw(addr, netsock::join_reply(false, r)),
+                    Some(r) => self.send_raw(addr, netsock::join_reply(false, r, netsock::SERVER_PLAYER_ID)),
                     None => {
                         self.peers.entry(addr).or_insert(Peer { last_heard: Instant::now(), player: None });
-                        self.send_raw(addr, netsock::join_reply(true, 0));
+                        self.send_raw(addr, netsock::join_reply(true, 0, netsock::SERVER_PLAYER_ID));
                     }
                 }
             }
@@ -242,8 +241,8 @@ impl Server {
                     self.send_raw(addr, netsock::create_reply(1, 0));
                     return;
                 };
-                let id = self.next_netsock_id;
-                self.next_netsock_id += 1;
+                // Stock ids: 0x10000 + table slot, with the host's own player in slot 0.
+                let id = netsock::SERVER_PLAYER_ID + 1 + slot as u32;
                 self.peers.get_mut(&addr).unwrap().player = Some(id);
                 self.send_raw(addr, netsock::create_reply(0, id));
                 let data = data.to_vec();
@@ -731,9 +730,9 @@ impl Server {
     }
 
     fn build_packet(&mut self, slot: u16) -> Vec<u8> {
-        let (seq, ack, kick, in_startup, stage_wire, stage_idx) = {
+        let (seq, ack, kick, in_startup, stage_wire, stage_idx, netsock_id) = {
             let c = self.conn(slot).unwrap();
-            (c.tx_seq, c.rx_ack, c.kick, c.in_startup, c.stage_wire, c.stage_idx)
+            (c.tx_seq, c.rx_ack, c.kick, c.in_startup, c.stage_wire, c.stage_idx, c.netsock_id)
         };
         let mut w = PacketWriter::new(seq, ack);
         if let Some(r) = kick {
@@ -741,7 +740,8 @@ impl Server {
         } else if in_startup {
             let mut b = stage_wire.to_le_bytes().to_vec();
             b.extend_from_slice(&self.session.to_le_bytes());
-            b.extend_from_slice(&(slot as u32).to_le_bytes());
+            // `NetSrv_WriteStartupData`: the connection's Netsock player id (`TachConn+8`).
+            b.extend_from_slice(&netsock_id.to_le_bytes());
             b.extend_from_slice(&self.startup_blob(slot, stage_idx));
             w.sub(packet::MSG_STARTUPDATA, &b);
         } else {

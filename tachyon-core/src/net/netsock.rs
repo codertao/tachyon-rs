@@ -197,11 +197,17 @@ pub const REFUSE_PASSWORD: u16 = 1;
 pub const REFUSE_GUID: u16 = 2;
 pub const REFUSE_FULL: u16 = 3;
 
-/// 0x1021 `{u16 status (1 accept, 2 refuse), u16 reason, u32}`.
-pub fn join_reply(accept: bool, reason: u16) -> Vec<u8> {
+/// Netsock player ids are `0x10000 + slot` in the host's player table (`FUN_100014f0`). The
+/// host's own player takes slot 0, and its id is the server id in 0x1021 (`FUN_10003f80`).
+/// Clients tag every server message with that id, and space.exe treats sender id 0 as a
+/// system message (`NetSock_GetMessage 0x4ab8a0`), so it must not be 0.
+pub const SERVER_PLAYER_ID: u32 = 0x10000;
+
+/// 0x1021 `{u16 status (1 accept, 2 refuse), u16 reason, u32 serverId}`.
+pub fn join_reply(accept: bool, reason: u16, server_id: u32) -> Vec<u8> {
     let mut b = (if accept { 1u16 } else { 2 }).to_le_bytes().to_vec();
     b.extend_from_slice(&reason.to_le_bytes());
-    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&server_id.to_le_bytes());
     message(JOIN_REPLY, &b)
 }
 

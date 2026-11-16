@@ -1,0 +1,15 @@
+[package]
+name = "tachyon_music_player"
+version = "0.1.0"
+edition = "2024"
+description = "Player for Tachyon: The Fringe's in-flight music (Ttfmusic.sbf + TTFMUSIC.BIN)"
+
+[[bin]]
+name = "tachyon-music-player"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "=0.31.1", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+anyhow = "1"
+cpal = "0.15"
+tachyon-core = { path = "../tachyon-core" }

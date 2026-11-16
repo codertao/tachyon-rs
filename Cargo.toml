@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["tachyon-core", "TachyonServer", "TachyonBot", "TachyonAssetViewer"]
+members = ["tachyon-core", "TachyonServer", "TachyonBot", "TachyonAssetViewer", "TachyonMusicPlayer"]
 
 # Moved here from TachyonAssetViewer/Cargo.toml: Cargo only honours profiles at the workspace root.
 [profile.dev]

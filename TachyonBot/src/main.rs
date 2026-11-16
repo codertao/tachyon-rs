@@ -237,6 +237,12 @@ fn connect(net: &mut Net, a: &Args, world: &World) -> Result<u32> {
             && netsock::kind(&m) == netsock::JOIN_REPLY {
                 let (status, reason) = (u16_at(&m, 4), u16_at(&m, 6));
                 if status == 1 {
+                    // space.exe tags server messages with this id and drops sender 0 as a
+                    // system message (`NetSock_GetMessage`), so a real client would hang here.
+                    let server_id = u32::from_le_bytes(m[8..12].try_into().unwrap());
+                    if server_id == 0 {
+                        bail!("join accepted with server id 0: a stock client would ignore every game packet");
+                    }
                     break;
                 }
                 bail!(

@@ -196,3 +196,9 @@ impl Audio {
         }
     }
 }
+
+impl Stream for tachyon_core::music::Player {
+    fn fill(&mut self, out: &mut [f32], rate: u32) {
+        tachyon_core::music::Player::fill(self, out, rate);
+    }
+}

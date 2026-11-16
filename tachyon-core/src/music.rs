@@ -4,11 +4,11 @@
 //! The game streams one segment at a time (`FUN_004b53b0`). When a segment runs out it runs the
 //! script (`FUN_004b5b80`), which picks the next one: an interactive score where each script
 //! state is a theme (intro, loop bars, ending) and the game's variables (sector, job, hostiles,
-//! shields) choose between themes. The viewer has no job or hostiles (every game variable is
-//! zero), so the UI picks a theme. The script sequences it, and when it ends, the player lets
-//! the script run on in the terminal states for a while, then starts the chosen theme again.
+//! shields) choose between themes. Here the UI picks a theme and sets the game variables
+//! (`NowPlaying::vars`; the asset viewer leaves them all zero). The script sequences it, and
+//! when it ends, the player lets the script run on in the terminal states for a while, then
+//! starts the chosen theme again. The player can also loop a single segment.
 
-use crate::audio::Stream;
 use anyhow::{bail, ensure, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -47,6 +47,11 @@ impl Sbf {
             segs.push((name, off, size));
         }
         Ok(Sbf { map, segs })
+    }
+
+    /// Length of segment `n` in seconds.
+    pub fn seconds(&self, n: usize) -> f32 {
+        self.segs.get(n).map_or(0.0, |s| (s.2 / BLOCK * BLOCK_FRAMES) as f32 / RATE as f32)
     }
 
     /// Look for `Ttfmusic.sbf` near the asset source. It sits in the game folder beside
@@ -487,26 +492,57 @@ pub const TERMINAL: &[usize] = &[0, 1, 2, 3, 44, 45, 56];
 pub const TERMINAL_SECONDS: f32 = 45.0;
 /// Script passes without a segment before the player fills a block of silence.
 const IDLE_PASSES: usize = 256;
+/// The game's variable slots at the start of script memory (`Music_SetVar 0x4b5670`).
+pub const GAME_VARS: usize = 8;
+/// What each game variable slot holds (`Music_UpdateFlightVars 0x415060`).
+pub const VAR_NAMES: [&str; GAME_VARS] =
+    ["hostiles", "dialog cue", "job status", "shields", "slot 4 (>3500: threat?)", "dialog timer", "sector", "job"];
+/// Segments kept in `NowPlaying::history`.
+const HISTORY: usize = 200;
 
-/// What's playing, plus the UI's request. Shared between the UI and the audio thread.
+/// A UI request, taken by the player on its next block.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Request {
+    /// Start a script state from its top, with fresh script variables.
+    Theme(usize),
+    /// Loop one segment, bypassing the script.
+    Clip(usize),
+}
+
+/// What's playing, plus the UI's controls. Shared between the UI and the audio thread.
 #[derive(Clone, Default)]
 pub struct NowPlaying {
     /// The theme chosen in the UI.
     pub home: usize,
+    /// The segment being looped, in clip mode.
+    pub clip: Option<usize>,
     /// The script state now running.
     pub state: usize,
-    /// The segment now playing (empty while silent).
+    /// The segment now playing (empty while silent) and its index.
     pub segment: String,
+    pub segment_index: Option<usize>,
+    /// Position in and length of the current segment, in seconds.
+    pub seg_pos: f32,
+    pub seg_len: f32,
     /// Seconds spent in terminal states since the theme ended.
     pub terminal_secs: f32,
-    /// Set by the UI to switch theme; the player takes it on its next block.
-    pub select: Option<usize>,
+    /// Segments played, oldest first: (state, segment name); the state is `None` in clip mode.
+    pub history: Vec<(Option<usize>, String)>,
+    /// Set by the UI to switch theme or clip; the player takes it on its next block.
+    pub select: Option<Request>,
+    /// Game variables (slots 0..8), written into the script's memory before every block.
+    pub vars: [i32; GAME_VARS],
+    /// Output nothing and hold position.
+    pub paused: bool,
+    /// Never restart the chosen theme: let the script run on by itself.
+    pub free_run: bool,
 }
 
 pub struct Player {
     sbf: Arc<Sbf>,
     vm: Vm,
     home: usize,
+    clip: Option<usize>,
     seg: Option<usize>,
     block: usize,
     frames: Vec<[f32; 2]>,
@@ -518,6 +554,8 @@ pub struct Player {
     silent: bool,
     /// Frames played since the chosen theme ended (terminal states or silence).
     terminal_frames: usize,
+    vars: [i32; GAME_VARS],
+    free_run: bool,
     pub now: Arc<Mutex<NowPlaying>>,
     pub gain: Arc<Mutex<f32>>,
 }
@@ -528,6 +566,7 @@ impl Player {
             sbf,
             vm: Vm::new(script, seed),
             home,
+            clip: None,
             seg: None,
             block: 0,
             frames: vec![],
@@ -536,6 +575,8 @@ impl Player {
             vol_to: 255.0,
             silent: false,
             terminal_frames: 0,
+            vars: [0; GAME_VARS],
+            free_run: false,
             now: Arc::default(),
             gain: Arc::new(Mutex::new(0.6)),
         };
@@ -566,22 +607,50 @@ impl Player {
             .collect()
     }
 
+    fn write_vars(&mut self) {
+        for (k, v) in self.vars.into_iter().enumerate() {
+            self.vm.wr(4 * k, v);
+        }
+    }
+
     /// Start `state` from its top with fresh script variables, cutting off what's playing.
     fn select(&mut self, state: usize) {
         self.home = state;
+        self.clip = None;
         self.vm.mem.iter_mut().for_each(|b| *b = 0);
+        self.write_vars();
         self.vm.volume = 255;
         self.vm.target = 255;
         self.vm.goto(state);
+        self.cut();
+        if let Ok(mut n) = self.now.lock() {
+            n.home = state;
+            n.clip = None;
+            n.state = self.vm.state;
+        }
+    }
+
+    /// Loop segment `n` on its own, cutting off what's playing.
+    fn select_clip(&mut self, n: usize) {
+        if n >= self.sbf.segs.len() {
+            return;
+        }
+        self.clip = Some(n);
+        self.cut();
+        if let Ok(mut now) = self.now.lock() {
+            now.clip = Some(n);
+        }
+    }
+
+    fn cut(&mut self) {
         self.seg = None;
         self.block = 0;
         self.frames.clear();
         self.pos = 0.0;
         self.terminal_frames = 0;
         if let Ok(mut n) = self.now.lock() {
-            n.home = state;
-            n.state = self.vm.state;
             n.segment.clear();
+            n.segment_index = None;
             n.terminal_secs = 0.0;
         }
     }
@@ -589,8 +658,15 @@ impl Player {
     /// The current segment ran out: ask the script for the next. `false` when the script only
     /// yielded (the game then streams nothing until a later pass picks a segment).
     fn next_segment(&mut self) -> bool {
+        if let Some(n) = self.clip {
+            if self.sbf.segs[n].2 >= BLOCK {
+                self.start(n);
+                return true;
+            }
+            return false;
+        }
         for _ in 0..IDLE_PASSES {
-            if self.terminal_frames as f32 > TERMINAL_SECONDS * RATE as f32 {
+            if !self.free_run && self.terminal_frames as f32 > TERMINAL_SECONDS * RATE as f32 {
                 self.select(self.home);
             }
             match self.vm.run() {
@@ -616,14 +692,26 @@ impl Player {
     fn start(&mut self, n: usize) {
         self.seg = Some(n);
         self.block = 0;
-        self.vol_from = self.vm.volume as f32;
-        self.vol_to = self.vm.target as f32;
-        // The game steps the volume towards the target across the segment's reads.
-        self.vm.volume = self.vm.target;
+        if self.clip.is_some() {
+            (self.vol_from, self.vol_to) = (255.0, 255.0);
+        } else {
+            self.vol_from = self.vm.volume as f32;
+            self.vol_to = self.vm.target as f32;
+            // The game steps the volume towards the target across the segment's reads.
+            self.vm.volume = self.vm.target;
+        }
         self.frames.clear();
         if let Ok(mut now) = self.now.lock() {
             now.segment = self.sbf.segs[n].0.clone();
+            now.segment_index = Some(n);
+            now.seg_len = self.sbf.seconds(n);
+            now.seg_pos = 0.0;
             now.state = self.vm.state;
+            let entry = (self.clip.is_none().then_some(self.vm.state), now.segment.clone());
+            now.history.push(entry);
+            if now.history.len() > HISTORY {
+                now.history.remove(0);
+            }
         }
     }
 
@@ -636,11 +724,24 @@ impl Player {
         self.frames.get(i).copied()
     }
 
-    fn load_block(&mut self) {
-        let req = self.now.lock().ok().and_then(|mut n| n.select.take());
-        if let Some(t) = req {
-            self.select(t);
+    /// Take the UI's request and settings.
+    fn sync(&mut self) {
+        let Ok(mut n) = self.now.lock() else { return };
+        let req = n.select.take();
+        self.vars = n.vars;
+        self.free_run = n.free_run;
+        drop(n);
+        match req {
+            Some(Request::Theme(t)) => self.select(t),
+            Some(Request::Clip(c)) => self.select_clip(c),
+            None => {}
         }
+        // The game refreshes its variables every frame; the script sees them on its next pass.
+        self.write_vars();
+    }
+
+    fn load_block(&mut self) {
+        self.sync();
         self.silent = false;
         if self.seg.is_none() || self.block >= self.seg_blocks() {
             if !self.next_segment() {
@@ -648,6 +749,7 @@ impl Player {
                 self.silent = true;
                 if let Ok(mut now) = self.now.lock() {
                     now.segment.clear();
+                    now.segment_index = None;
                 }
                 self.frames.resize(BLOCK_FRAMES, [0.0; 2]);
                 return;
@@ -665,7 +767,7 @@ impl Player {
     /// Account for a finished block: time after the chosen theme ended counts towards
     /// restarting it.
     fn block_done(&mut self, frames: usize) {
-        if self.silent || TERMINAL.contains(&self.vm.state) {
+        if self.clip.is_none() && (self.silent || TERMINAL.contains(&self.vm.state)) {
             self.terminal_frames += frames;
         } else {
             self.terminal_frames = 0;
@@ -673,12 +775,15 @@ impl Player {
         if let Ok(mut n) = self.now.lock() {
             n.state = self.vm.state;
             n.terminal_secs = self.terminal_frames as f32 / RATE as f32;
+            n.seg_pos = (self.block * BLOCK_FRAMES) as f32 / RATE as f32;
         }
     }
-}
 
-impl Stream for Player {
-    fn fill(&mut self, out: &mut [f32], rate: u32) {
+    /// Add interleaved stereo frames at `rate` Hz into `out`.
+    pub fn fill(&mut self, out: &mut [f32], rate: u32) {
+        if self.now.lock().is_ok_and(|n| n.paused) {
+            return;
+        }
         let step = RATE as f64 / rate as f64;
         let gain = self.gain.lock().map_or(0.6, |g| *g);
         for f in out.chunks_exact_mut(2) {
@@ -796,6 +901,56 @@ mod player_tests {
             eprintln!("{t:?}");
         }
         assert!(t.iter().filter(|x| x.1 == "wharmp1").count() >= 2);
+    }
+
+    fn player() -> Option<Player> {
+        let src = AssetSource::open(Path::new("../../pff")).ok()?;
+        let sbf = Arc::new(Sbf::open(&Sbf::find(Path::new("../../pff"))?).ok()?);
+        let s = Arc::new(Script::parse(src.read("TTFMUSIC.BIN").ok()?).ok()?);
+        Some(Player::new(sbf, s, 0xbabeface, 4))
+    }
+
+    /// Run `secs` of audio, returning the segments started (from the history).
+    fn run(p: &mut Player, secs: f32) -> Vec<(Option<usize>, String)> {
+        let start = p.now.lock().unwrap().history.len();
+        let mut buf = vec![0.0f32; 2 * 4096];
+        for _ in 0..(secs * RATE as f32 / 4096.0) as usize {
+            p.fill(&mut buf, RATE);
+        }
+        p.now.lock().unwrap().history[start..].to_vec()
+    }
+
+    #[test]
+    fn clip_loops() {
+        let Some(mut p) = player() else { return };
+        p.now.lock().unwrap().select = Some(Request::Clip(7));
+        let name = p.sbf.segs[7].0.clone();
+        let len = p.sbf.seconds(7);
+        let h = run(&mut p, len * 3.5);
+        assert!(h.len() >= 3, "{h:?}");
+        assert!(h.iter().all(|x| x == &(None, name.clone())), "{h:?}");
+    }
+
+    #[test]
+    fn hostiles_switch_to_combat() {
+        // Theme 4 (f1i1) with hostiles: between bars it goes to the combat states (11, f1i1e*);
+        // when they leave, a combat ending (9 or 10).
+        let Some(mut p) = player() else { return };
+        p.now.lock().unwrap().select = Some(Request::Theme(4));
+        let calm = run(&mut p, 20.0);
+        assert!(calm.iter().all(|x| x.0 != Some(11)), "{calm:?}");
+        p.now.lock().unwrap().vars[0] = 3;
+        let fight = run(&mut p, 40.0);
+        if std::env::var("TAV_TRACE").is_ok() {
+            eprintln!("{fight:?}");
+        }
+        assert!(fight.iter().any(|x| x.0 == Some(11) && x.1.starts_with("f1i1e")), "{fight:?}");
+        p.now.lock().unwrap().vars[0] = 0;
+        let after = run(&mut p, 40.0);
+        if std::env::var("TAV_TRACE").is_ok() {
+            eprintln!("{after:?}");
+        }
+        assert!(after.iter().any(|x| matches!(x.0, Some(9 | 10))), "{after:?}");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! egui front end: asset list on the left, 3D view on the right.
 
 use crate::audio::Audio;
-use crate::music;
+use tachyon_core::music;
 use crate::gate::{self, GateMode};
 use crate::pwf::{Bank, Sound};
 use std::collections::HashMap;
@@ -400,7 +400,7 @@ impl ViewerApp {
                 snd.music_state = Some(pick);
                 if let Some(m) = &snd.music {
                     if let Ok(mut n) = m.lock() {
-                        n.select = Some(pick);
+                        n.select = Some(music::Request::Theme(pick));
                     }
                 }
             }

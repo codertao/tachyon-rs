@@ -1,10 +1,12 @@
 //! Shared Tachyon: The Fringe code: asset access, file formats and the multiplayer wire protocol.
-//! Used by the dedicated server (`TachyonServer`) and the test client (`TachyonBot`).
+//! Used by the dedicated server (`TachyonServer`), the test client (`TachyonBot`), the asset
+//! viewer and the music player.
 
 pub mod cbin;
 pub mod des;
 pub mod math;
 pub mod mpc;
+pub mod music;
 pub mod net;
 pub mod ocf;
 pub mod pak;

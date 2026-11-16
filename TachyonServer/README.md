@@ -31,8 +31,13 @@ tachyon-server --join-page 192.168.1.20 --port 2766 > Startup.htm
 ```
 
 1. Back up the game's `Startup.htm` (in the game folder) and replace it with the generated one.
-2. Start the game, Multiplayer → **Network**. Wait for the NovaWorld ping to time out and press
-   **Continue**. The browser opens the page and the game starts joining.
+2. Start the game, Multiplayer → **Network**. Wait for the NovaWorld ping to time out (about
+   10 s) and press **Continue**. The browser opens the page and the game starts joining.
+   **Don't press Skip** (it appears after a couple of seconds, in the same place). Skipping
+   leaves Netsock's ping thread running. That thread then competes with the join for the
+   server's replies, and it crashes the client 30 s later (`page fault on write access to
+   0x00000008` in `netsock+0x3b9b`). This is a stock-client bug; see `multiplayer.md`
+   "NovaWorld (online lobby)".
 
 `host:port` must be at most 21 characters (a limit of the game's decoder).
 

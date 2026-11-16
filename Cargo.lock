@@ -2537,6 +2537,17 @@ dependencies = [
  "eframe",
  "egui_glow",
  "memmap2",
+ "tachyon-core",
+]
+
+[[package]]
+name = "tachyon_music_player"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "eframe",
+ "tachyon-core",
 ]
 
 [[package]]

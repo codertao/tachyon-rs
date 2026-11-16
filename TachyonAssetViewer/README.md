@@ -243,7 +243,7 @@ Blinking parts (26 PAKs):
 ## Music
 
 The **Music** checkbox, under the pff path, plays the game's in-flight music in the background
-(`src/music.rs`; `decomp/notes/music.md`).
+(`tachyon-core/src/music.rs`; `decomp/notes/music.md`).
 - **Where it comes from:** the segments are in `Ttfmusic.sbf`, in the game folder beside
   `Tachyon.pff`. The viewer looks next to the asset source, in its parent folder, and in that
   folder's subfolders. The segments are 451 short clips of IMA ADPCM, 22,050 Hz stereo.
@@ -275,7 +275,7 @@ The **Music** checkbox, under the pff path, plays the game's in-flight music in 
 | `src/gate.rs` | `.anm` parse and playback, hyper gate poses, keyframe sound timing |
 | `src/pwf.rs` | `.PWF` sound bank and WAV decode |
 | `src/audio.rs` | software mixer → `cpal` output stream |
-| `src/music.rs` | `Ttfmusic.sbf` ADPCM streaming, `TTFMUSIC.BIN` script VM, theme player |
+| `tachyon-core/src/music.rs` | `Ttfmusic.sbf` ADPCM streaming, `TTFMUSIC.BIN` script VM, theme player (shared with `TachyonMusicPlayer`) |
 | `src/weather.rs` | Lightning flash simulation and fog-sheet camera tracking |
 | `src/spx.rs` | SPX sector parse, `desnames.cfg` / `.des` model lookup, parent sector |
 | `examples/cbindump.rs` | prints any CBIN file (`cargo run --release --example cbindump -- FILE`) |
