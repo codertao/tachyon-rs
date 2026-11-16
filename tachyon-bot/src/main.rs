@@ -1,4 +1,4 @@
-//! TachyonBot: a headless Tachyon: The Fringe multiplayer client. Joins a game, flies slow
+//! tachyon-bot: a headless Tachyon: The Fringe multiplayer client. Joins a game, flies slow
 //! circles and logs what it sees. Protocol notes: `decomp/notes/multiplayer.md`.
 
 mod engine;
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use world::{fmt, World};
 
-const USAGE: &str = "usage: TachyonBot <host[:port]> [options]
+const USAGE: &str = "usage: tachyon-bot <host[:port]> [options]
   --name NAME        player name (default TachyonBot)
   --ship ALIAS       ship desnames alias (default BORA_CUTLASS)
   --team bora|galspan|N   team / race index (default bora)

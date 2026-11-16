@@ -1,4 +1,4 @@
-# TachyonBot
+# tachyon-bot
 
 A headless multiplayer client for Tachyon: The Fringe (proof of concept). It joins a hosted
 game, flies its ship in slow circles and prints what it sees: entities appearing and

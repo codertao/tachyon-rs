@@ -275,7 +275,7 @@ The **Music** checkbox, under the pff path, plays the game's in-flight music in 
 | `src/gate.rs` | `.anm` parse and playback, hyper gate poses, keyframe sound timing |
 | `src/pwf.rs` | `.PWF` sound bank and WAV decode |
 | `src/audio.rs` | software mixer → `cpal` output stream |
-| `tachyon-core/src/music.rs` | `Ttfmusic.sbf` ADPCM streaming, `TTFMUSIC.BIN` script VM, theme player (shared with `TachyonMusicPlayer`) |
+| `tachyon-core/src/music.rs` | `Ttfmusic.sbf` ADPCM streaming, `TTFMUSIC.BIN` script VM, theme player (shared with `tachyon-music-player`) |
 | `src/weather.rs` | Lightning flash simulation and fog-sheet camera tracking |
 | `src/spx.rs` | SPX sector parse, `desnames.cfg` / `.des` model lookup, parent sector |
 | `examples/cbindump.rs` | prints any CBIN file (`cargo run --release --example cbindump -- FILE`) |

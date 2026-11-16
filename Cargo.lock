@@ -3,14 +3,6 @@
 version = 4
 
 [[package]]
-name = "TachyonBot"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "tachyon-core",
-]
-
-[[package]]
 name = "ab_glyph"
 version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2513,23 +2505,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tachyon-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "memmap2",
-]
-
-[[package]]
-name = "tachyon-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "tachyon-core",
-]
-
-[[package]]
-name = "tachyon_asset_viewer"
+name = "tachyon-asset-viewer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2541,12 +2517,36 @@ dependencies = [
 ]
 
 [[package]]
-name = "tachyon_music_player"
+name = "tachyon-bot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tachyon-core",
+]
+
+[[package]]
+name = "tachyon-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "memmap2",
+]
+
+[[package]]
+name = "tachyon-music-player"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "cpal",
  "eframe",
+ "tachyon-core",
+]
+
+[[package]]
+name = "tachyon-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "tachyon-core",
 ]
 

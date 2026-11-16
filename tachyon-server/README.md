@@ -43,5 +43,5 @@ tachyon-server --join-page 192.168.1.20 --port 2766 > Startup.htm
 
 ## Testing without the game
 
-`TachyonBot` is a headless client: `TachyonBot 127.0.0.1:2766 --name Bot --ship BORA_CUTLASS
+`tachyon-bot` is a headless client: `tachyon-bot 127.0.0.1:2766 --name Bot --ship BORA_CUTLASS
 --team 1 --say "/status"`.

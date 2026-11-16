@@ -1,5 +1,5 @@
 [package]
-name = "tachyon_music_player"
+name = "tachyon-music-player"
 version = "0.1.0"
 edition = "2024"
 description = "Player for Tachyon: The Fringe's in-flight music (Ttfmusic.sbf + TTFMUSIC.BIN)"

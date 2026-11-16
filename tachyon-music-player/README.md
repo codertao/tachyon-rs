@@ -6,8 +6,8 @@ player are in `tachyon-core/src/music.rs` (shared with the asset viewer). The fo
 script's logic are described in `decomp/notes/music.md`.
 
 ```sh
-cargo run --release -p tachyon_music_player -- ../pff             # extracted asset directory
-cargo run --release -p tachyon_music_player -- ../GoG/Tachyon.pff  # or the archive itself
+cargo run --release -p tachyon-music-player -- ../pff             # extracted asset directory
+cargo run --release -p tachyon-music-player -- ../GoG/Tachyon.pff  # or the archive itself
 ```
 
 `Ttfmusic.sbf` is looked for next to the path, in its parent folder and in that folder's

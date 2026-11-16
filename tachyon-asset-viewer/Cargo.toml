@@ -1,5 +1,5 @@
 [package]
-name = "tachyon_asset_viewer"
+name = "tachyon-asset-viewer"
 version = "0.1.0"
 edition = "2021"
 description = "Viewer for Tachyon: The Fringe PAK/OCF 3D models"
