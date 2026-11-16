@@ -2,12 +2,14 @@
 //! reads. Layouts: `decomp/notes/multiplayer.md` "App event catalogue".
 
 use crate::net::netsock::{cstr, fixed_str};
-use crate::net::proto::{u16_at, u32_at};
+use crate::net::proto::{i32_at, u16_at, u32_at};
 use crate::net::startup::{roster_entry, RosterEntry};
 
 pub const EV_TEXT: u16 = 0x1001;
 pub const EV_FIRED: u16 = 0x1002;
 pub const EV_DESTROYED: u16 = 0x1003;
+pub const EV_IMPACT: u16 = 0x1004;
+pub const EV_YOU_WERE_HIT: u16 = 0x1005;
 pub const EV_YOU_DIED: u16 = 0x1006;
 pub const EV_ENTER_QUADRANT: u16 = 0x1007;
 pub const EV_DESPAWN: u16 = 0x1011;
@@ -21,6 +23,8 @@ pub const EV_ROSTER: u16 = 0x1110;
 pub const EV_STARTUP_DONE: u16 = 0x1111;
 pub const EV_SCOREBOARD: u16 = 0x1112;
 pub const EV_AMMO: u16 = 0x1124;
+pub const EV_ROUND_FREEZE: u16 = 0x1119;
+pub const EV_ROUND_RESUME: u16 = 0x1120;
 
 pub const CL_FIRE: u16 = 0x2001;
 pub const CL_HIT: u16 = 0x2003;
@@ -115,6 +119,196 @@ pub fn parse_data_ack(b: &[u8]) -> (u16, u32, u16) {
     (u16_at(b, 0), u32_at(b, 2), u16_at(b, 6))
 }
 
+
+fn put_vec(b: &mut Vec<u8>, v: [i32; 3]) {
+    for x in v {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+}
+
+fn vec_at(b: &[u8], o: usize) -> [i32; 3] {
+    [i32_at(b, o), i32_at(b, o + 4), i32_at(b, o + 8)]
+}
+
+/// 0x2001 fire bolt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fire {
+    pub pos: [i32; 3],
+    /// High 16 bits of the 16.16 angles.
+    pub angles: [u16; 3],
+    pub client_frame: u16,
+    pub slot: u8,
+    pub weapon: u8,
+    pub volume: u8,
+}
+
+pub fn parse_fire(b: &[u8]) -> Fire {
+    Fire {
+        pos: vec_at(b, 0),
+        angles: [u16_at(b, 0xc), u16_at(b, 0xe), u16_at(b, 0x10)],
+        client_frame: u16_at(b, 0x12),
+        slot: b.get(0x14).copied().unwrap_or(0),
+        weapon: b.get(0x16).copied().unwrap_or(0),
+        volume: b.get(0x17).copied().unwrap_or(0),
+    }
+}
+
+pub fn fire(f: &Fire) -> Vec<u8> {
+    let mut b = Vec::with_capacity(0x1c);
+    put_vec(&mut b, f.pos);
+    for a in f.angles {
+        b.extend_from_slice(&a.to_le_bytes());
+    }
+    b.extend_from_slice(&f.client_frame.to_le_bytes());
+    b.extend_from_slice(&[f.slot, 0, f.weapon, f.volume]);
+    b.resize(0x1c, 0);
+    b
+}
+
+/// 0x1002 `{vec3 pos, u16 angles[3], u16 serverFrame @0x12, u8 weapon @0x16, u8 volume @0x17,
+/// u32 shooterId @0x18}` (`TachSrv_OnFire` copies the 0x2001 fields).
+pub fn fired(f: &Fire, server_frame: u16, shooter: u32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(0x1c);
+    put_vec(&mut b, f.pos);
+    for a in f.angles {
+        b.extend_from_slice(&a.to_le_bytes());
+    }
+    b.extend_from_slice(&server_frame.to_le_bytes());
+    b.extend_from_slice(&[0, 0, f.weapon, f.volume]);
+    b.extend_from_slice(&shooter.to_le_bytes());
+    b
+}
+
+/// 0x2003 hit report, and 0x2027 (capital ship part) with the part id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hit {
+    pub pos: [i32; 3],
+    pub target: u32,
+    pub weapon: u8,
+    /// 1 shield hit, 2 hull hit (picks the impact effect only).
+    pub kind: u8,
+    /// Damage scale, 16.16 (the wire carries it `>> 2`).
+    pub scale: u32,
+    pub part: Option<u16>,
+}
+
+pub fn parse_hit(b: &[u8]) -> Hit {
+    Hit {
+        pos: vec_at(b, 0),
+        target: u32_at(b, 0xc),
+        weapon: b.get(0x10).copied().unwrap_or(0),
+        kind: b.get(0x11).copied().unwrap_or(0),
+        scale: (u16_at(b, 0x12) as u32) << 2,
+        part: None,
+    }
+}
+
+/// 0x2027 `{vec3 hitPos, u32 targetId, u16 partId @0x10, u8 weapon @0x12, u8 kind @0x13,
+/// u16 scale>>2 @0x14}` (`TachSrv_OnPartHit`).
+pub fn parse_part_hit(b: &[u8]) -> Hit {
+    Hit {
+        pos: vec_at(b, 0),
+        target: u32_at(b, 0xc),
+        part: Some(u16_at(b, 0x10)),
+        weapon: b.get(0x12).copied().unwrap_or(0),
+        kind: b.get(0x13).copied().unwrap_or(0),
+        scale: (u16_at(b, 0x14) as u32) << 2,
+    }
+}
+
+pub fn hit(h: &Hit) -> Vec<u8> {
+    let mut b = Vec::with_capacity(0x16);
+    put_vec(&mut b, h.pos);
+    b.extend_from_slice(&h.target.to_le_bytes());
+    match h.part {
+        None => {
+            b.extend_from_slice(&[h.weapon, h.kind]);
+            b.extend_from_slice(&((h.scale >> 2) as u16).to_le_bytes());
+        }
+        Some(p) => {
+            b.extend_from_slice(&p.to_le_bytes());
+            b.extend_from_slice(&[h.weapon, h.kind]);
+            b.extend_from_slice(&((h.scale >> 2) as u16).to_le_bytes());
+        }
+    }
+    b
+}
+
+/// 0x1003 `{vec3 pos, u32 deadId @0xc, u32 @0x10, u8 effect @0x14, u8 size @0x15}`.
+pub fn destroyed(pos: [i32; 3], dead: u32, effect: u8, size: u8) -> Vec<u8> {
+    let mut b = Vec::with_capacity(0x16);
+    put_vec(&mut b, pos);
+    b.extend_from_slice(&dead.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&[effect, size]);
+    b
+}
+
+/// 0x1004 `{vec3 pos, u32 hitId @0xc, u32 projectileId @0x10, u16 @0x14, u16 dir[3] @0x16}`.
+pub fn impact(pos: [i32; 3], hit_id: u32, projectile: u32, dir: [i32; 3]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(0x1c);
+    put_vec(&mut b, pos);
+    b.extend_from_slice(&hit_id.to_le_bytes());
+    b.extend_from_slice(&projectile.to_le_bytes());
+    b.extend_from_slice(&0u16.to_le_bytes());
+    for a in dir {
+        b.extend_from_slice(&((a as u32 >> 16) as u16).to_le_bytes());
+    }
+    b
+}
+
+/// 0x1014 `{u16 op, u16 value, u32 entityId}`; op 8 = remove.
+pub fn entity_op(op: u16, value: u16, id: u32) -> Vec<u8> {
+    let mut b = op.to_le_bytes().to_vec();
+    b.extend_from_slice(&value.to_le_bytes());
+    b.extend_from_slice(&id.to_le_bytes());
+    b
+}
+
+/// 0x1011 `{u32 entityId}`.
+pub fn despawn(id: u32) -> Vec<u8> {
+    id.to_le_bytes().to_vec()
+}
+
+/// 0x1012 `{vec3 pos, vec3 angles}` (16.16).
+pub fn teleport(pos: [i32; 3], angles: [i32; 3]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(0x18);
+    put_vec(&mut b, pos);
+    put_vec(&mut b, angles);
+    b
+}
+
+/// 0x1007 `{vec3 pos, u16 angles[3] @0xc, u16 quadrantId @0x12, u8 @0x14, u8 @0x15,
+/// char sectorBdf[14] @0x16, char name[] @0x24}` (`SrvSend_EnterQuadrant`).
+pub fn enter_quadrant(pos: [i32; 3], angles: [i32; 3], quadrant: u16, b14: u8, b15: u8, bdf: &str) -> Vec<u8> {
+    let mut b = Vec::with_capacity(0x34);
+    put_vec(&mut b, pos);
+    for a in angles {
+        b.extend_from_slice(&((a as u32 >> 16) as u16).to_le_bytes());
+    }
+    b.extend_from_slice(&quadrant.to_le_bytes());
+    b.extend_from_slice(&[b14, b15]);
+    b.extend_from_slice(&fixed_str(bdf, 14));
+    b.resize(0x34, 0);
+    b
+}
+
+/// 0x2005 `{u16 op, u16 amount}`.
+pub fn parse_power(b: &[u8]) -> (u16, u16) {
+    (u16_at(b, 0), u16_at(b, 2))
+}
+
+/// 0x2009 `{u32 impactSpeed, u32 otherId}`.
+pub fn parse_collision(b: &[u8]) -> (i32, u32) {
+    (i32_at(b, 0), u32_at(b, 4))
+}
+
+pub fn collision(speed: i32, other: u32) -> Vec<u8> {
+    let mut b = speed.to_le_bytes().to_vec();
+    b.extend_from_slice(&other.to_le_bytes());
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +319,24 @@ mod tests {
         assert_eq!(text(0, 0, "abcde").len(), 12);
         assert_eq!(parse_text(&text(0, 11, "hi there")), (0, 11, "hi there".into()));
         assert_eq!(scoreboard(&[(1, 2, 3)]), [1, 0, 1, 0, 2, 0, 3, 0]);
+    }
+
+    #[test]
+    fn combat_bodies() {
+        let f = Fire { pos: [1, -2, 3], angles: [4, 5, 6], client_frame: 7, slot: 1, weapon: 9, volume: 0x80 };
+        assert_eq!(fire(&f).len(), 0x1c);
+        assert_eq!(parse_fire(&fire(&f)), f);
+        let r = fired(&f, 77, 0x123);
+        assert_eq!((r.len(), u16_at(&r, 0x12), r[0x16], r[0x17], u32_at(&r, 0x18)), (0x1c, 77, 9, 0x80, 0x123));
+        let h = Hit { pos: [1, 2, 3], target: 0x101, weapon: 3, kind: 1, scale: 0x10000, part: None };
+        assert_eq!(hit(&h).len(), 0x14);
+        assert_eq!(parse_hit(&hit(&h)), h);
+        let p = Hit { part: Some(4), ..h };
+        assert_eq!(hit(&p).len(), 0x16);
+        assert_eq!(parse_part_hit(&hit(&p)), p);
+        assert_eq!(destroyed([0; 3], 5, 3, 0).len(), 0x16);
+        assert_eq!(impact([0; 3], 0, 0, [0; 3]).len(), 0x1c);
+        assert_eq!(enter_quadrant([0; 3], [0; 3], 1, 1, 1, "x.bdf").len(), 0x34);
+        assert_eq!(parse_collision(&collision(-5, 9)), (-5, 9));
     }
 }

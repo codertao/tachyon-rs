@@ -433,14 +433,23 @@ fn event(kind: u16, b: &[u8], from_client: bool) -> Option<String> {
             b.get(0x17).unwrap_or(&0)
         ),
         0x2002 | 0x2006 | 0x2013 | 0x2014 | 0x2015 | 0x2023 => format!("entity {}", id(u32_at(b, 0))),
-        0x2003 | 0x2027 => format!(
-            "weapon {} kind {} hit {} at {} scale {}{}",
+        0x2003 => format!(
+            "weapon {} kind {} hit {} at {} scale {}",
             b.get(0x10).unwrap_or(&0),
             b.get(0x11).unwrap_or(&0),
             id(u32_at(b, 0xc)),
             pos(vec3(b, 0)),
-            u16_at(b, 0x12) as u32 * 4,
-            if kind == 0x2027 { format!(" part {}", u16_at(b, 0x14)) } else { String::new() }
+            u16_at(b, 0x12) as u32 * 4
+        ),
+        // `TachSrv_OnPartHit`: part @0x10, weapon @0x12, kind @0x13, scale @0x14.
+        0x2027 => format!(
+            "weapon {} kind {} hit {} part {} at {} scale {}",
+            b.get(0x12).unwrap_or(&0),
+            b.get(0x13).unwrap_or(&0),
+            id(u32_at(b, 0xc)),
+            u16_at(b, 0x10),
+            pos(vec3(b, 0)),
+            u16_at(b, 0x14) as u32 * 4
         ),
         0x2004 => format!(
             "slot {} weapon {} at {} target {} lock {} client frame {}",

@@ -62,7 +62,7 @@ impl Tables {
 
 /// The power block (`PowerBlock`; `shields.md`). Values in the game's units.
 #[derive(Debug, Clone, Copy, Default)]
-#[allow(dead_code)] // laser/burner are used by power ops and regen (M2)
+#[allow(dead_code)] // laser/burner: the host never tracks them for players; AI ships use them (M5)
 pub struct Power {
     pub laser: i32,
     pub shield_front: i32,
@@ -98,8 +98,7 @@ impl Power {
 pub enum Owner {
     /// A connected player's ship (conn slot).
     Player(u16),
-    /// Placed from the SPX (M2).
-    #[allow(dead_code)]
+    /// Placed from the SPX.
     Static,
 }
 
@@ -120,12 +119,16 @@ pub struct Entity {
     pub state_flags: u8,
     pub throttle: u8,
     pub team: u8,
-    /// DCB +0xc3: bit 0 = not network-visible (dead); `& 3 == 3` = static object.
+    /// DCB +0xc3: bit 0 = left out of near/far snapshot records (dead players, statics);
+    /// `& 3 == 3` = static object, sent in static pages; bit 2 = static record carries the
+    /// descriptor slot.
     pub net_flags: u8,
     /// 16.16 render scale.
     pub scale: i32,
     pub power: Power,
     pub target: u32,
+    /// Asteroid hitpoints (`+0xbc` = int(scale) x `HITPOINTS`).
+    pub hp: i32,
 }
 
 impl Entity {
@@ -139,7 +142,8 @@ impl Entity {
             pos: self.pos,
             vel: self.vel,
             angles: self.angles,
-            ext: ext.then(|| ((self.scale >> 8) as u16, self.desc_slot as i16)),
+            // `Tach_SrvWriteEntityRecordExt`: the descriptor slot only with net flag 4, else -1.
+            ext: ext.then(|| ((self.scale >> 8) as u16, if self.net_flags & 4 != 0 { self.desc_slot as i16 } else { -1 })),
         }
     }
 
@@ -222,6 +226,7 @@ mod tests {
             id: 1, owner: Owner::Static, des, desc_slot: 0, model: 0, pos: [0; 3], vel: [0; 3],
             angles: [ANGLE_MASK - 10 * FX, 0, 0], net_pos: [100 * FX, 0, 0], net_angles: [10 * FX, 0, 0],
             state_flags: 5, throttle: 0, team: 0, net_flags: 0, scale: FX, power: Power::default(), target: 0,
+            hp: 0,
         };
         for _ in 0..200 {
             e.smooth_step();

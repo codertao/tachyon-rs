@@ -2,6 +2,9 @@
 //! events, round-robin sends) and the game rules hooks. Single-threaded, ticked at 50 Hz.
 //! References: `decomp/notes/multiplayer.md`, especially "Server-side startup details".
 
+mod combat;
+mod rules;
+
 use crate::map::Map;
 use crate::packetlog::PacketLog;
 use crate::world::{distance, Entity, Owner, Power, World, ANGLE_MASK, FX};
@@ -10,6 +13,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tachyon_core::mpc::GameType;
 use tachyon_core::net::events::{self as ev};
+use std::rc::Rc;
+use tachyon_core::des::Des;
 use tachyon_core::net::netsock::{self, ClientMsg};
 use tachyon_core::net::packet::{self, Outbox, PacketWriter, TagRing, BUDGET_RELIABLE};
 use tachyon_core::net::proto::{self, parse_join_blob, parse_player_data, JoinInfo, StatusOut};
@@ -38,6 +43,10 @@ pub struct Options {
     pub password: String,
     pub max_players: u32,
     pub original_bugs: bool,
+    /// Deathmatch kill limit (`spacesav[0x62]`, default 20; 0 = none).
+    pub max_kills: u32,
+    /// Round length in minutes (`spacesav[0x61]`, default 30; 0 = untimed).
+    pub time_limit_min: u32,
 }
 
 /// Delivery spec (`NetSrv_QueueEvent`; filter `Tach_SrvEventFilter 0x4620b0`).
@@ -108,6 +117,16 @@ pub struct Conn {
     pub deaths: u16,
     far_list: Vec<u32>,
     far_cursor: Option<usize>,
+    /// conn +0x1d0: dead or frozen; takes no damage.
+    pub dead: bool,
+    /// conn `inQuadrant`: snapshots carry records only while set. Cleared by 0x1007, set
+    /// again by 0x2008 kind 2.
+    pub in_quadrant: bool,
+    /// Static object pages (`Srv_SendStaticObjs`; conn +0x120..+0x130): the list sorted by
+    /// distance (0 = removed since), how many the client has acked, and the page id.
+    static_list: Vec<u32>,
+    static_acked: usize,
+    static_page: u32,
 }
 
 /// A Netsock peer that has joined (0x1020) but may not have created a player yet.
@@ -130,6 +149,9 @@ pub struct Server {
     pub outgoing: Vec<(SocketAddr, Vec<u8>)>,
     pub log: Option<PacketLog>,
     rng: u64,
+    /// Round timer and between-rounds freeze, in ticks (`DAT_005b2824` / `DAT_005b2820`).
+    pub round_ticks: u32,
+    pub freeze_ticks: u32,
 }
 
 fn now_seed() -> u64 {
@@ -153,8 +175,11 @@ impl Server {
             outgoing: vec![],
             log,
             rng: seed,
+            round_ticks: 0,
+            freeze_ticks: 0,
         };
         s.load_world();
+        s.start_round_timer();
         s
     }
 
@@ -176,7 +201,81 @@ impl Server {
                 self.world.tables.add_des(&d);
             }
         }
-        // World statics (asteroids, stations, powerups) are spawned in M2.
+        self.spawn_statics();
+    }
+
+    /// The SPX placements the host builds as entities. So far: asteroids (`Asteroid_SpawnAtLoad`:
+    /// net flags 7, hitpoints = int(scale) x `HITPOINTS`). Starbases (OCF part entities) and
+    /// powerups follow.
+    fn spawn_statics(&mut self) {
+        let placements = self.map.spx.placements.clone();
+        for p in placements {
+            if p.deferred() {
+                continue;
+            }
+            let Some(des) = self.map.des_for(p.decl).cloned() else { continue };
+            if des.desc_type != "ASTEROID" {
+                continue;
+            }
+            let Some((desc_slot, model)) = self.world.tables.add_des(&des) else { continue };
+            let scale = (p.scale * 65536.0) as i32;
+            let hp = (scale >> 16) * des_num(&des, "MAIN", "HITPOINTS") as i32;
+            let pos = p.pos.map(|v| (v * 65536.0) as i32);
+            let angles = p.orient.map(|a| (a << 16) & ANGLE_MASK);
+            let id = self.world.alloc_id();
+            self.world.spawn(Entity {
+                id,
+                owner: Owner::Static,
+                des,
+                desc_slot,
+                model: model.unwrap_or(0),
+                pos,
+                vel: [0; 3],
+                angles,
+                net_pos: pos,
+                net_angles: angles,
+                state_flags: 0,
+                throttle: 0,
+                team: 0,
+                net_flags: 7,
+                scale,
+                power: Power::default(),
+                target: 0,
+                hp,
+            });
+        }
+    }
+
+    /// `MpSectors_Reset`: drop every static and build them again from the SPX (new ids).
+    fn respawn_statics(&mut self) {
+        let statics: Vec<u32> = self.world.order.iter().copied().filter(|id| self.world.get(*id).is_some_and(|e| e.owner == Owner::Static)).collect();
+        for id in statics {
+            self.world.remove(id);
+        }
+        self.spawn_statics();
+    }
+
+    /// Remove a static and blank it in every static list (`Srv_NotifyEntityRemoved`).
+    fn remove_static(&mut self, id: u32) {
+        self.world.remove(id);
+        for c in self.conns.iter_mut().flatten() {
+            for e in c.static_list.iter_mut().filter(|e| **e == id) {
+                *e = 0;
+            }
+        }
+    }
+
+    /// `Srv_SendStaticObjs`: every entity with net flags `& 3 == 3`, nearest to the ship first;
+    /// page id = (id + 1) | 1.
+    fn build_static_list(&mut self, slot: u16) {
+        let Some(c) = self.conn(slot) else { return };
+        let origin = self.world.get(c.ship).map_or(c.camera, |e| e.pos);
+        let mut list: Vec<(i64, u32)> = self.world.order.iter().filter_map(|id| self.world.get(*id)).filter(|e| e.net_flags & 3 == 3).map(|e| (distance(origin, e.pos), e.id)).collect();
+        list.sort_by_key(|(d, _)| *d);
+        let c = self.conn_mut(slot).unwrap();
+        c.static_list = list.into_iter().map(|(_, id)| id).collect();
+        c.static_acked = 0;
+        c.static_page = c.static_page.wrapping_add(1) | 1;
     }
 
     pub fn player_count(&self) -> usize {
@@ -406,6 +505,11 @@ impl Server {
             deaths: 0,
             far_list: vec![],
             far_cursor: None,
+            dead: false,
+            in_quadrant: true,
+            static_list: vec![],
+            static_acked: 0,
+            static_page: 0,
         };
         // Loadout: each mount at its max ammo (`MpRules_CopyLoadout`, then `MpRules_ClearLoadout`
         // copies max into the ammo counter).
@@ -457,6 +561,7 @@ impl Server {
             scale: FX,
             power,
             target: 0,
+            hp: 0,
         });
         let portrait_name = join.portrait.clone();
         let portrait = self.portrait_slot(&portrait_name);
@@ -470,6 +575,7 @@ impl Server {
                 c.team = team;
             }
         }
+        self.build_static_list(slot);
         self.queue(ev::EV_TEAM_SHIP, ev::team_ship(&des.file, desc_slot), Delivery::all());
         if portrait >= 0 {
             self.queue(ev::EV_PORTRAIT, ev::portrait(&portrait_name, portrait as u16), Delivery::all());
@@ -603,10 +709,13 @@ impl Server {
     fn on_event(&mut self, slot: u16, kind: u16, b: &[u8]) {
         match kind {
             ev::CL_CHAT => self.on_chat(slot, b),
-            ev::CL_DATA_ACK => {
-                // Static pages arrive in M2; kind 2 only marks the conn as in the quadrant.
-                let _ = ev::parse_data_ack(b);
-            }
+            ev::CL_DATA_ACK => self.on_data_ack(slot, b),
+            ev::CL_FIRE => self.on_fire(slot, b),
+            ev::CL_HIT => self.on_hit(slot, ev::parse_hit(b)),
+            ev::CL_PART_HIT => self.on_hit(slot, ev::parse_part_hit(b)),
+            ev::CL_POWER => self.on_power_op(slot, b),
+            ev::CL_COLLISION => self.on_collision(slot, b),
+            ev::CL_RESPAWN => self.on_respawn(slot),
             ev::CL_ENTER_WORLD => {
                 if let Some(c) = self.conn_mut(slot) {
                     c.state = 0;
@@ -624,6 +733,25 @@ impl Server {
                     l.note(&format!("slot {slot}: unhandled event {kind:#06x} ({} bytes)", b.len()));
                 }
             }
+        }
+    }
+
+    /// 0x2008 (`TachSrv_OnDataChunk`): kind 1 acks a static page (`Srv_RecvPlayerChunk`), kind 2
+    /// marks the client as in the quadrant.
+    fn on_data_ack(&mut self, slot: u16, b: &[u8]) {
+        let (kind, page, count) = ev::parse_data_ack(b);
+        let Some(c) = self.conn_mut(slot) else { return };
+        match kind {
+            1 if !c.static_list.is_empty() && c.static_page == page => {
+                c.static_acked += count as usize;
+                if c.static_acked >= c.static_list.len() {
+                    c.static_list.clear();
+                    c.static_acked = 0;
+                }
+                c.static_page = c.static_page.wrapping_add(1) | 1;
+            }
+            2 => c.in_quadrant = true,
+            _ => {}
         }
     }
 
@@ -694,6 +822,8 @@ impl Server {
     // ---- tick ----
 
     pub fn tick(&mut self) {
+        self.round_tick();
+        self.regen();
         // Per-player think: smoothing filter.
         let ids: Vec<u32> = self.world.order.clone();
         for id in ids {
@@ -817,9 +947,9 @@ impl Server {
 
     /// `Tach_SrvWriteGameData 0x461a30` + `Tach_SrvWriteSnapshot 0x461870`.
     fn game_data(&mut self, slot: u16) -> Vec<u8> {
-        let (camera, ship, state) = {
+        let (camera, ship, state, in_quadrant) = {
             let c = self.conn(slot).unwrap();
-            (c.camera, c.ship, c.state)
+            (c.camera, c.ship, c.state, c.in_quadrant)
         };
         let me = self.world.get(ship);
         let mut status = StatusOut { target_meters: [0xff; 3], ..Default::default() };
@@ -834,7 +964,8 @@ impl Server {
             }
         }
         let mut recs = vec![];
-        if state != 1 {
+        let mut page = (0u16, 0u16);
+        if state != 1 && in_quadrant {
             let visible = |e: &Entity| e.id != ship && e.net_flags & 1 == 0;
             // Near: within the near radius, at most 8 (2 while loading).
             let mut near: Vec<(i64, u32)> = self.world.order.iter().filter_map(|id| self.world.get(*id)).filter(|e| visible(e)).map(|e| (distance(camera, e.pos), e.id)).filter(|(d, _)| *d < NEAR_RADIUS).collect();
@@ -855,8 +986,21 @@ impl Server {
             for id in far_ids {
                 recs.push(self.world.get(id).unwrap().record(proto::REC_FAR, false));
             }
+            // The current static page (`Tach_SrvWritePersistentPage`): 12 records while loading,
+            // else 4, repeated until acked. Removed entries count but aren't written.
+            let c = self.conn(slot).unwrap();
+            if !c.static_list.is_empty() {
+                let size = if state == 2 { 12 } else { 4 };
+                let n = (c.static_list.len() - c.static_acked).min(size);
+                page = (c.static_page as u16, n as u16);
+                for id in &c.static_list[c.static_acked..c.static_acked + n] {
+                    if let Some(e) = self.world.get(*id) {
+                        recs.push(e.record(0, true));
+                    }
+                }
+            }
         }
-        proto::write_gamedata(&status, camera, (0, 0), &recs)
+        proto::write_gamedata(&status, camera, page, &recs)
     }
 
     /// `Tach_SrvBuildFarList` / `Tach_SrvWriteFarRecords`.
@@ -915,6 +1059,11 @@ impl Server {
     }
 }
 
+/// A number from a `.des` group (0 if missing).
+fn des_num(des: &Rc<Des>, group: &str, key: &str) -> f32 {
+    des.group(group).and_then(|g| g.get(key)).and_then(|i| i.values.first()).and_then(|v| v.as_f32()).unwrap_or(0.0)
+}
+
 fn pct(v: i32, max: i32) -> u8 {
     if max <= 0 { 0xff } else { (v.max(0) as i64 * 100 / max as i64).min(100) as u8 }
 }
@@ -936,68 +1085,233 @@ pub fn face_toward(from: [i32; 3], to: [i32; 3]) -> [i32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tachyon_core::net::proto::{join_blob, player_data, startup_records, JoinBlob, ShipState};
+    use std::collections::HashSet;
+    use tachyon_core::net::proto::{join_blob, player_data, startup_records, JoinBlob, ShipState, Snapshot};
     use tachyon_core::source::AssetSource;
 
-    fn server() -> Option<Server> {
+    fn server(map: &str) -> Option<Server> {
         let src = AssetSource::open(std::path::Path::new("../../pff")).ok()?;
-        let cfg = tachyon_core::mpc::find(&src, "DM_01").ok()?;
+        let cfg = tachyon_core::mpc::find(&src, map).ok()?;
         let map = Map::load(src, cfg).ok()?;
-        Some(Server::new(Options { name: "t".into(), password: String::new(), max_players: 8, original_bugs: false }, map, None))
+        Some(Server::new(Options { name: "t".into(), password: String::new(), max_players: 8, original_bugs: false, max_kills: 20, time_limit_min: 30 }, map, None))
     }
 
-    /// Drives a fake client through join, the six startup stages and into the game, and checks
-    /// a second client then shows up in the first one's snapshots.
-    #[test]
-    fn join_handshake_and_snapshots() {
-        let Some(mut s) = server() else { return };
-        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let addr2: SocketAddr = "127.0.0.1:5001".parse().unwrap();
-        let blob = join_blob(&JoinBlob { ship: "BORA_CUTLASS", team: 1, portrait: "", game_id: 0, weapon: 6 });
-        for a in [addr, addr2] {
-            s.on_datagram(a, &netsock::join_request(""));
-            s.on_datagram(a, &netsock::create_player(1, "P", &blob));
+    /// A scripted client: acks startup stages, static pages and 0x1007, sends PLAYERDATA at
+    /// `pos` and whatever events the test queues, and keeps every event and snapshot it gets.
+    struct Client {
+        addr: SocketAddr,
+        seq: u32,
+        tag: u32,
+        pos: [i32; 3],
+        out: Vec<(u16, Vec<u8>)>,
+        seen: HashSet<u32>,
+        events: Vec<(u16, Vec<u8>)>,
+        snaps: Vec<Snapshot>,
+        stage: u32,
+        acked_pages: HashSet<u16>,
+    }
+
+    struct Harness {
+        s: Server,
+        c: Vec<Client>,
+    }
+
+    impl Harness {
+        fn new(map: &str, n: usize) -> Option<Harness> {
+            let mut s = server(map)?;
+            let mut c = vec![];
+            for i in 0..n {
+                let addr: SocketAddr = format!("127.0.0.1:{}", 5000 + i).parse().unwrap();
+                let blob = join_blob(&JoinBlob { ship: "BORA_CUTLASS", team: 1, portrait: "", game_id: 0, weapon: 6 });
+                s.on_datagram(addr, &netsock::join_request(""));
+                s.on_datagram(addr, &netsock::create_player(1, &format!("P{i}"), &blob));
+                c.push(Client {
+                    addr,
+                    seq: 1,
+                    tag: 0x1000,
+                    pos: [0, 625 << 16, (2000 + 100 * i as i32) << 16],
+                    out: vec![],
+                    seen: HashSet::new(),
+                    events: vec![],
+                    snaps: vec![],
+                    stage: 0,
+                    acked_pages: HashSet::new(),
+                });
+            }
+            Some(Harness { s, c })
         }
-        let mut seqs = [1u32, 1];
-        let mut stages_seen = [0u32; 2];
-        let mut saw_other = false;
-        let mut tag = 0x1000;
-        for _ in 0..16 * 10 {
-            s.tick();
-            for (a, msg) in std::mem::take(&mut s.outgoing) {
-                let i = if a == addr { 0 } else { 1 };
-                let Some(ClientMsg::GameData(p)) = netsock::parse_client(&msg) else { continue };
-                let (seq, _, subs) = packet::parse(p).unwrap();
-                let mut w = PacketWriter::new(seqs[i], seq);
-                seqs[i] += 1;
-                for sub in subs {
-                    match sub.kind {
-                        packet::MSG_STARTUPDATA => {
-                            let stage = proto::u32_at(sub.body, 0);
-                            assert!(!startup_records(&sub.body[12..]).is_empty());
-                            stages_seen[i] = stages_seen[i].max(stage);
-                            let mut b = 1u16.to_le_bytes().to_vec();
-                            b.extend_from_slice(&stage.to_le_bytes());
-                            w.event(packet::EV_STARTUP_ACK, tag, &b);
-                            tag += 2;
+
+        fn ship(&self, i: usize) -> u32 {
+            self.s.conns[i].as_ref().unwrap().ship
+        }
+
+        fn run(&mut self, ticks: usize) {
+            for _ in 0..ticks {
+                self.s.tick();
+                for (a, msg) in std::mem::take(&mut self.s.outgoing) {
+                    let Some(i) = self.c.iter().position(|c| c.addr == a) else { continue };
+                    let Some(ClientMsg::GameData(p)) = netsock::parse_client(&msg) else { continue };
+                    let (seq, _, subs) = packet::parse(p).unwrap();
+                    let c = &mut self.c[i];
+                    let mut w = PacketWriter::new(c.seq, seq);
+                    c.seq += 1;
+                    let mut replies: Vec<(u16, Vec<u8>)> = vec![];
+                    for sub in subs {
+                        match sub.kind {
+                            packet::MSG_STARTUPDATA => {
+                                let stage = proto::u32_at(sub.body, 0);
+                                assert!(!startup_records(&sub.body[12..]).is_empty());
+                                c.stage = c.stage.max(stage);
+                                let mut b = 1u16.to_le_bytes().to_vec();
+                                b.extend_from_slice(&stage.to_le_bytes());
+                                w.event(packet::EV_STARTUP_ACK, c.tag, &b);
+                                c.tag += 2;
+                            }
+                            packet::MSG_GAMEDATA => {
+                                let snap = proto::parse_gamedata(sub.body).unwrap();
+                                if snap.page_count > 0 && c.acked_pages.insert(snap.page_list) {
+                                    let mut b = 1u16.to_le_bytes().to_vec();
+                                    b.extend_from_slice(&(snap.page_list as u32).to_le_bytes());
+                                    b.extend_from_slice(&snap.page_count.to_le_bytes());
+                                    replies.push((ev::CL_DATA_ACK, b));
+                                }
+                                c.snaps.push(snap);
+                            }
+                            k if k >= 8 => {
+                                if c.seen.insert(sub.tag.unwrap_or(0)) {
+                                    if k == ev::EV_ENTER_QUADRANT {
+                                        replies.push((ev::CL_DATA_ACK, vec![2, 0, 0, 0, 0, 0, 0, 0]));
+                                    }
+                                    c.events.push((k, sub.body.to_vec()));
+                                }
+                            }
+                            _ => {}
                         }
-                        packet::MSG_GAMEDATA if i == 0 => {
-                            let snap = proto::parse_gamedata(sub.body).unwrap();
-                            saw_other |= !snap.records.is_empty();
-                        }
-                        _ => {}
                     }
+                    replies.append(&mut c.out);
+                    for (k, b) in replies {
+                        w.event(k, c.tag, &b);
+                        c.tag += 2;
+                    }
+                    let mut pd = 0u32.to_le_bytes().to_vec();
+                    pd.extend_from_slice(&(c.seq * 16).to_le_bytes());
+                    pd.extend_from_slice(&self.s.session.to_le_bytes());
+                    pd.extend_from_slice(&player_data(&ShipState { pos: c.pos, valid: true, ..Default::default() }, c.seq * 16));
+                    w.sub(packet::MSG_PLAYERDATA, &pd);
+                    let addr = c.addr;
+                    self.s.on_datagram(addr, &netsock::game_data(&w.finish()));
                 }
-                let mut pd = 0u32.to_le_bytes().to_vec();
-                pd.extend_from_slice(&(seqs[i] * 16).to_le_bytes());
-                pd.extend_from_slice(&s.session.to_le_bytes());
-                pd.extend_from_slice(&player_data(&ShipState { pos: [0, 625 << 16, (2000 + 100 * i as i32) << 16], valid: true, ..Default::default() }, seqs[i] * 16));
-                w.sub(packet::MSG_PLAYERDATA, &pd);
-                s.on_datagram(a, &netsock::game_data(&w.finish()));
             }
         }
-        assert_eq!(stages_seen, [6, 6]);
-        assert!(s.conns.iter().flatten().all(|c| !c.in_startup));
-        assert!(saw_other, "the second player never appeared in the first one's snapshots");
+
+        fn got(&self, i: usize, kind: u16) -> Vec<&Vec<u8>> {
+            self.c[i].events.iter().filter(|(k, _)| *k == kind).map(|(_, b)| b).collect()
+        }
+
+        /// Client `from` reports laser hits on client `to` until `to` dies (or 400 hits).
+        fn kill(&mut self, from: usize, to: usize) {
+            let target = self.ship(to);
+            for _ in 0..40 {
+                if self.s.conns[to].as_ref().unwrap().dead {
+                    return;
+                }
+                for _ in 0..10 {
+                    let h = ev::Hit { pos: self.c[to].pos, target, weapon: 2, kind: 1, scale: 0x10000, part: None };
+                    self.c[from].out.push((ev::CL_HIT, ev::hit(&h)));
+                }
+                self.run(16);
+            }
+        }
+    }
+
+    /// Two fake clients get through join and the six startup stages, and each shows up in the
+    /// other's snapshots.
+    #[test]
+    fn join_handshake_and_snapshots() {
+        let Some(mut h) = Harness::new("DM_01", 2) else { return };
+        h.run(16 * 10);
+        assert_eq!([h.c[0].stage, h.c[1].stage], [6, 6]);
+        assert!(h.s.conns.iter().flatten().all(|c| !c.in_startup));
+        let b = h.ship(1);
+        assert!(h.c[0].snaps.iter().any(|s| s.records.iter().any(|r| r.id == b)), "the second player never appeared in the first one's snapshots");
+    }
+
+    /// 0x2001 is relayed as 0x1002 to the other player, not back to the shooter.
+    #[test]
+    fn fire_is_relayed() {
+        let Some(mut h) = Harness::new("DM_01", 2) else { return };
+        h.run(16 * 10);
+        let f = ev::Fire { pos: h.c[0].pos, angles: [1, 2, 3], client_frame: 9, slot: 0, weapon: 6, volume: 0x80 };
+        h.c[0].out.push((ev::CL_FIRE, ev::fire(&f)));
+        h.run(48);
+        let shots = h.got(1, ev::EV_FIRED);
+        assert_eq!(shots.len(), 1);
+        assert_eq!((proto::u32_at(shots[0], 0x18), shots[0][0x16]), (h.ship(0), 6));
+        assert!(h.got(0, ev::EV_FIRED).is_empty());
+    }
+
+    /// Hit reports drain shields then hull; the kill sends 0x1006 to the victim, credits the
+    /// killer, prints a kill line; 0x2011 respawns the victim with full power.
+    #[test]
+    fn kill_and_respawn() {
+        let Some(mut h) = Harness::new("DM_01", 2) else { return };
+        h.run(16 * 10);
+        h.kill(0, 1);
+        h.run(32);
+        assert!(h.s.conns[1].as_ref().unwrap().dead, "400 heavy laser hits didn't kill");
+        assert_eq!(h.got(1, ev::EV_YOU_DIED).len(), 1);
+        assert!(!h.got(1, ev::EV_YOU_WERE_HIT).is_empty());
+        assert_eq!((h.s.conns[0].as_ref().unwrap().kills, h.s.conns[1].as_ref().unwrap().deaths), (1, 1));
+        let texts: Vec<String> = h.got(0, ev::EV_TEXT).iter().map(|b| ev::parse_text(b).2).collect();
+        assert!(texts.iter().any(|t| t.contains("P0") && t.contains("P1")), "{texts:?}");
+        // The dead ship drops out of the killer's snapshots.
+        let victim = h.ship(1);
+        assert!(!h.c[0].snaps.last().unwrap().records.iter().any(|r| r.id == victim));
+
+        h.c[1].out.push((ev::CL_RESPAWN, vec![0, 0]));
+        h.run(48);
+        assert_eq!(h.got(1, ev::EV_TELEPORT).len(), 1);
+        assert!(!h.s.conns[1].as_ref().unwrap().dead);
+        let e = h.s.world.get(victim).unwrap();
+        assert_eq!((e.power.hull, e.power.shield_front, e.net_flags), (e.power.hull_max, e.power.shield_max, 0));
+    }
+
+    /// At the kill limit everyone gets 0x1119; after the freeze the round resets (session bump,
+    /// 0x1007 to each player, scores cleared) and resumes with 0x1120.
+    #[test]
+    fn kill_limit_ends_and_resets_the_round() {
+        let Some(mut h) = Harness::new("DM_01", 2) else { return };
+        h.s.opts.max_kills = 1;
+        h.run(16 * 10);
+        let session = h.s.session;
+        h.kill(0, 1);
+        h.run(32);
+        for i in 0..2 {
+            assert_eq!(h.got(i, ev::EV_ROUND_FREEZE).len(), 1, "client {i}");
+        }
+        h.run(rules::FREEZE_TICKS as usize + 64);
+        assert_eq!(h.s.session, session + 1);
+        for i in 0..2 {
+            assert_eq!(h.got(i, ev::EV_ENTER_QUADRANT).len(), 1, "client {i}");
+            assert_eq!(h.got(i, ev::EV_ROUND_RESUME).len(), 1, "client {i}");
+            let c = h.s.conns[i].as_ref().unwrap();
+            assert_eq!((c.kills, c.deaths, c.dead, c.in_quadrant), (0, 0, false, true));
+        }
+    }
+
+    /// Asteroids reach clients as static pages: 4 extended records per snapshot (12 while
+    /// loading), repeated until acked, nearest first, with the descriptor slot.
+    #[test]
+    fn asteroids_arrive_in_static_pages() {
+        let Some(mut h) = Harness::new("DM_02", 1) else { return };
+        let total = h.s.world.entities.values().filter(|e| e.net_flags & 3 == 3).count();
+        assert!(total > 800, "{total}");
+        h.run(16 * 40);
+        let paged: Vec<_> = h.c[0].snaps.iter().flat_map(|s| s.records.iter()).filter(|r| r.flags & proto::REC_PAGED != 0).collect();
+        assert!(paged.len() >= 4 * 20, "{}", paged.len());
+        assert!(paged.iter().all(|r| r.desc.is_some_and(|d| d >= 0)));
+        assert!(h.c[0].snaps.iter().all(|s| s.page_count <= 4));
+        let c = h.s.conns[0].as_ref().unwrap();
+        assert!(c.static_acked >= 4 * 20 && c.static_acked < total, "{}", c.static_acked);
     }
 }

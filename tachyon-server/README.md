@@ -4,8 +4,13 @@ A console dedicated multiplayer server for *Tachyon: The Fringe*, speaking the o
 protocol so stock `space.exe` clients can join. Deathmatch and Base Wars maps, assets from
 `Tachyon.pff` or an unpacked directory.
 
-Status: **M1 (join and fly)**. Players join, load, fly, see each other, chat and leave. World
-objects, combat, turrets, AI pilots and Base Wars rules come in later milestones (see the plan).
+Status: **M2 in progress (PvP Deathmatch)**. Players join, load, fly, see each other, chat and
+leave (M1). Combat follows the stock host: shots are relayed, hit reports drain shields and hull,
+kills are credited with the original kill lines, players respawn, shields regenerate and power
+transfers work; collisions hurt both sides. Rounds end at the kill limit or time limit, freeze
+for 20 s and restart. Asteroids are built from the map and sent the way the stock host sends
+them. Still missing from M2: starbases (station part entities) and powerups. Turrets, server
+missiles, AI pilots and Base Wars rules come in later milestones (see the plan).
 Deliberate differences from the original host: `DEVIATIONS.md`.
 
 ## Running
@@ -16,7 +21,12 @@ cargo run --release -p tachyon-server -- --assets /path/to/Tachyon.pff --map DM_
 ```
 
 Options: `--port` (default 2766, the port the game's Network screen uses), `--name`,
-`--max-players`, `--password`, `--original-bugs`, `--log-packets <file>`, `--log-detail`.
+`--max-players`, `--password`, `--max-kills <n>` (Deathmatch kill limit, default 20, 0 = none),
+`--time-limit <minutes>` (round length, default 30, 0 = untimed), `--original-bugs`,
+`--log-packets <file>`, `--log-detail`.
+
+After a round ends the same map restarts; the original moves on to the next map in its list,
+which this server doesn't do yet.
 
 `--log-packets` writes every engine packet in and out with a hex dump, plus the Netsock session
 messages (enumerate, join, create player, leave and their replies, interpreted) and datagrams
