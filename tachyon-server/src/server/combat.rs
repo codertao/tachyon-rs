@@ -121,7 +121,31 @@ pub fn collision_factor(speed: i32, max_speed_raw: f32) -> f32 {
     (v / max_speed_raw * 0.95).clamp(0.2, 1.25)
 }
 
+/// Engine angle (16.16, 512 units per turn) in degrees.
+fn deg(a: i32) -> f64 {
+    (a & ANGLE_MASK) as f64 / FX as f64 * 360.0 / 512.0
+}
+
+fn change(what: &str, a: i32, b: i32) -> String {
+    if a == b { format!("{what} {a}") } else { format!("{what} {a}->{b} ({:+})", b - a) }
+}
+
+/// Before → after for the pools that matter.
+fn power_change(a: &Power, b: &Power) -> String {
+    format!("{}  {}  {}", change("front", a.shield_front, b.shield_front), change("rear", a.shield_rear, b.shield_rear), change("hull", a.hull, b.hull))
+}
+
 impl Server {
+    /// Who an entity is, for debug lines.
+    fn debug_name(&self, id: Option<u32>) -> String {
+        let Some(id) = id else { return "nobody".into() };
+        match self.world.get(id).map(|e| e.owner) {
+            Some(Owner::Player(s)) => self.conn(s).map_or(format!("{id:#x}"), |c| format!("{} (slot {s})", c.name)),
+            Some(Owner::Static) => format!("{} {id:#x}", self.world.get(id).map_or("?", |e| e.des.desc_type.as_str()).to_ascii_lowercase()),
+            None => format!("{id:#x}"),
+        }
+    }
+
     fn ship_of(&self, slot: u16) -> u32 {
         self.conn(slot).map_or(0, |c| c.ship)
     }
@@ -170,6 +194,20 @@ impl Server {
             // entities (starbases and M4 turrets). Until then only the impact plays.
         }
         let amount = ((def.damage as i64 * h.scale as i64) >> 16) as i32;
+        if self.opts.debug_damage {
+            println!(
+                "DMG {} hit {} with {} ({:#04x}){}: base {} x scale {:.3} = {amount}; factors shield {}/256 hull {}/256",
+                self.debug_name(Some(ship)),
+                self.debug_name(Some(h.target)),
+                def.name,
+                h.weapon,
+                h.part.map_or(String::new(), |p| format!(" on part {p}")),
+                def.damage,
+                h.scale as f64 / 65536.0,
+                def.shield_factor,
+                def.hull_factor
+            );
+        }
         let d = Damage {
             weapon: h.weapon,
             amount,
@@ -206,21 +244,57 @@ impl Server {
             return None;
         }
         let original = self.opts.original_bugs;
+        let debug = self.opts.debug_damage;
         let e = self.world.get_mut(id)?;
         if e.power.hull <= 0 {
             return None;
         }
-        let mut bearing = engine_atan2((d.hit_pos[0] as f64 - e.pos[0] as f64) / 2.0, (d.hit_pos[2] as f64 - e.pos[2] as f64) / 2.0);
-        if !original {
-            // DEVIATIONS.md "Shield facing": measure the bearing from the nose. A ship at yaw y
-            // points along (sin y, cos y), whose engine bearing is y + 256 units.
-            bearing = bearing.wrapping_sub(e.angles[0].wrapping_add(256 * FX)) & ANGLE_MASK;
-        }
+        let world_bearing = engine_atan2((d.hit_pos[0] as f64 - e.pos[0] as f64) / 2.0, (d.hit_pos[2] as f64 - e.pos[2] as f64) / 2.0);
+        // DEVIATIONS.md "Shield facing": measure the bearing from the nose. A ship at yaw y
+        // points along (sin y, cos y), whose engine bearing is y + 256 units.
+        let nose_bearing = world_bearing.wrapping_sub(e.angles[0].wrapping_add(256 * FX)) & ANGLE_MASK;
+        let bearing = if original { world_bearing } else { nose_bearing };
         let (front, rear) = split_front_rear(bearing, d.amount);
         let scale = |v: i32| ((PLAYER_DAMAGE_SCALE * v as i64) as u32 >> 8) as i32;
+        let before = e.power;
         let result = apply_damage_fr(&mut e.power, scale(front), scale(rear), d.shield_factor, d.hull_factor);
+        let after = e.power;
         let killed = e.power.hull < 1;
         let target_pos = e.pos;
+        if debug {
+            let rel: Vec<String> = (0..3).map(|k| format!("{:.0}", ((d.hit_pos[k] as f64 - target_pos[k] as f64) / FX as f64).round() + 0.0)).collect();
+            let (sf, sr) = (scale(front), scale(rear));
+            let shield = |v: i32| ((v as i64 * d.shield_factor as i64) as u32 >> 8) as i32;
+            let hull = |v: i32| ((v as i64 * d.hull_factor as i64) as u32 >> 8) as i32;
+            let threshold = before.shield_max / 100;
+            let mut b = ((bearing as u32) >> 16) & 0x1ff;
+            if b > 0x100 {
+                b = 0x200 - b;
+            }
+            println!(
+                "    hit point ({}) from the ship; world bearing {:.1}, yaw {:.1}, off the nose {:.1} deg (0 ahead, 180 behind); split uses {} -> rear share {}/256",
+                rel.join(", "),
+                deg(world_bearing),
+                deg(e.angles[0]),
+                deg(nose_bearing),
+                if original { "world bearing (--original-bugs)" } else { "nose bearing" },
+                b
+            );
+            println!(
+                "    {} -> front {front} / rear {rear}; x{PLAYER_DAMAGE_SCALE}/256 -> front {sf} / rear {sr}; shield drain front {} rear {}; hull share front {} rear {} (taken while that pool < {threshold})",
+                d.amount,
+                shield(sf),
+                shield(sr),
+                hull(sf),
+                hull(sr)
+            );
+            println!(
+                "    {}  [{}]  regen +{} each per 16 ticks",
+                power_change(&before, &after),
+                if killed { "KILLED" } else if result == 2 { "hull hit" } else { "shields held" },
+                (256 * (after.shield_rate >> 11)) >> 8
+            );
+        }
         let mut except = None;
         if killed {
             self.ship_killed(id, d.shooter, d.kind);
@@ -239,7 +313,13 @@ impl Server {
         if e.hp <= 0 {
             return;
         }
+        let hp = e.hp;
         e.hp -= ((d.hull_factor as i64 * d.amount as i64) as u32 >> 8) as i32;
+        if self.opts.debug_damage {
+            let e = &self.world.entities[&id];
+            println!("    asteroid {id:#x}: {} x hull {}/256 -> {}", d.amount, d.hull_factor, change("hp", hp, e.hp));
+        }
+        let Some(e) = self.world.get_mut(id) else { return };
         if e.hp >= 1 {
             return;
         }
@@ -342,6 +422,11 @@ impl Server {
     /// 0x2011 → `Srv_RespawnPlayer(conn, 1)`: new spawn point, alive, 0x1012 to the player,
     /// `Ship_InitPower`.
     pub(super) fn on_respawn(&mut self, slot: u16) {
+        // DEVIATIONS.md "Respawn requests": the original honours 0x2011 at any time, so a
+        // modified client can teleport to a fresh spawn with full shields, or leave the freeze.
+        if !self.opts.original_bugs && (self.freeze_ticks != 0 || self.conn(slot).is_none_or(|c| !c.dead)) {
+            return;
+        }
         let (pos, angles) = self.dm_spawn_pos();
         let ship = {
             let Some(c) = self.conn_mut(slot) else { return };
@@ -402,7 +487,9 @@ impl Server {
     pub(super) fn on_power_op(&mut self, slot: u16, b: &[u8]) {
         let (op, amount) = ev::parse_power(b);
         let ship = self.ship_of(slot);
+        let debug = self.opts.debug_damage.then(|| self.debug_name(Some(ship)));
         let Some(e) = self.world.get_mut(ship) else { return };
+        let before = e.power;
         let p = &mut e.power;
         let max = p.shield_max;
         // `Power_TransferPool`: move min(src/8, room) into dst.
@@ -442,6 +529,10 @@ impl Server {
             3..=6 => srv(p, op, amount as i32),
             _ => {}
         }
+        if let Some(name) = debug {
+            const OPS: [&str; 7] = ["?", "front->rear", "rear->front", "recharge", "recharge", "drain", "drain"];
+            println!("POWER {name} op {op} ({}) amount {amount}: {}", OPS.get(op as usize).unwrap_or(&"?"), power_change(&before, &e.power));
+        }
     }
 
     /// 0x2009 (`TachSrv_OnCollision`). The client reports its speed and what it hit; the
@@ -461,8 +552,23 @@ impl Server {
         let max_raw = e.des.ship.as_ref().map_or(0.0, |s| s.max_speed * MAX_SPEED_SCALE);
         let f = collision_factor(speed, max_raw);
         let dmg = (e.power.shield_max as f32 * f).round() as i32;
+        let before = e.power;
         apply_collision_damage(&mut e.power, dmg);
+        let after = e.power;
         let my_pos = e.pos;
+        if self.opts.debug_damage {
+            println!(
+                "DMG {} collided with {}: speed {speed} (max {max_raw:.0}) -> factor {f:.3} x shield max {} = {dmg}; front pool at half rate, hull once front <= {}",
+                self.debug_name(Some(ship)),
+                if other == 0 { "scenery".into() } else { self.debug_name(Some(other)) },
+                before.shield_max,
+                before.shield_max / 100
+            );
+            println!("    {}", power_change(&before, &after));
+            if other != 0 && other != ship {
+                println!("    {} takes {dmg} (factors 256/256){}", self.debug_name(Some(other)), if original { " with no ram credit (--original-bugs)" } else { "" });
+            }
+        }
         if other != 0 && other != ship {
             // The original stages shooter = this ship and kind 1, but `TachSrv_DamageEntityById`
             // then clears the shooter and leaves the previous hit's factors and position staged,

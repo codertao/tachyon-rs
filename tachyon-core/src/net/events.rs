@@ -23,10 +23,19 @@ pub const EV_ROSTER: u16 = 0x1110;
 pub const EV_STARTUP_DONE: u16 = 0x1111;
 pub const EV_SCOREBOARD: u16 = 0x1112;
 pub const EV_AMMO: u16 = 0x1124;
+
+/// 0x1124 `{u16 mount, u16 count}` (`SrvSend_Ammo`; client `CliOn_Ammo` sets that mount's count).
+pub fn ammo(mount: u16, count: u16) -> Vec<u8> {
+    let mut b = mount.to_le_bytes().to_vec();
+    b.extend_from_slice(&count.to_le_bytes());
+    b
+}
+pub const EV_CLASS_INFO: u16 = 0x1100;
 pub const EV_ROUND_FREEZE: u16 = 0x1119;
 pub const EV_ROUND_RESUME: u16 = 0x1120;
 
 pub const CL_FIRE: u16 = 0x2001;
+pub const CL_CLASS_INFO: u16 = 0x2002;
 pub const CL_HIT: u16 = 0x2003;
 pub const CL_FIRE_GUIDED: u16 = 0x2004;
 pub const CL_POWER: u16 = 0x2005;
@@ -290,6 +299,21 @@ pub fn enter_quadrant(pos: [i32; 3], angles: [i32; 3], quadrant: u16, b14: u8, b
     b.extend_from_slice(&[b14, b15]);
     b.extend_from_slice(&fixed_str(bdf, 14));
     b.resize(0x34, 0);
+    b
+}
+
+/// 0x1100 for a player ship (`SrvSend_EntityClassInfo` + the SHIP class writer `LAB_00463690`):
+/// `{u32 id, u16 descSlot, u8 type 1, u8 flags 0, u16 0xffff, u16 slot, u16 0xffff, u8 0, u8 0}`.
+/// The client (`ShipReplica_Init`) keeps type at `+0x76`, the slot at `+0xf2` (roster slot for
+/// the pilot's name) and the 0xffff fields at `+0x114` / `+0x11c`.
+pub fn class_info_player(id: u32, desc_slot: u16, slot: u16) -> Vec<u8> {
+    let mut b = id.to_le_bytes().to_vec();
+    b.extend_from_slice(&desc_slot.to_le_bytes());
+    b.extend_from_slice(&[1, 0]);
+    b.extend_from_slice(&0xffffu16.to_le_bytes());
+    b.extend_from_slice(&slot.to_le_bytes());
+    b.extend_from_slice(&0xffffu16.to_le_bytes());
+    b.extend_from_slice(&[0, 0]);
     b
 }
 

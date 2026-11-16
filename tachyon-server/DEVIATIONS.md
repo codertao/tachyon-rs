@@ -13,6 +13,12 @@ behaviour where that is practical.
 | NovaWorld | Heartbeats to the master server; checks the join blob's game ID | Neither | n/a |
 | Model / descriptor slots | Filled as ships first appear, so a ship type that joins later gets slots the earlier clients never received in their startup tables | The 11 `vars.cfg` player ships are registered at startup, so every client gets the same table | no |
 | Chat commands | Command hook is a stub; every line is relayed | Lines starting with `/` (after the client's `NAME: ` prefix) are answered by the server and not relayed to other players | no |
+| Ammo at round start | `MpRules_ResetRound` → `Ship_InitPower` refills only the server's ammo counts; the client keeps what it had left | The server also sends 0x1124 for each ammo mount, so the client's counts match | restores |
+| Shield regen rate | PLAYERDATA `+0x2c` used as sent; a modified client can regenerate shields at any speed | Clamped to 0..2.0, the range the stock client cycles through | restores |
+| Respawn requests | 0x2011 honoured at any time: alive players teleport to a fresh spawn with full shields and ammo, and a player can leave the between-round freeze early | Ignored unless the player is dead and the round isn't frozen | restores |
+| Round timer | Keeps counting through a kill-limit freeze; if it runs out then, the round is frozen a second time | Paused during the freeze | restores |
+| Minutes left | `DM_MsgMinutesLeft` tests minutes % 3000 instead of ticks % 3000, so "%d MINUTES LEFT IN THIS ROUND" never appears | Announced on each whole minute while 5 or more minutes are left (the evident intent) | restores (silent) |
+| Round freeze | 1000 ticks (20 s) between rounds | 500 ticks (10 s), at the user's request | restores |
 | Spawn pitch | `Vec_DirAngles(pos, origin)` also pitches the nose toward the origin | Same yaw (checked against `Math_Atan2Core`), pitch 0; the client owns its pose from then on | no |
 
 Further fixes are proposed to the user before they are added.

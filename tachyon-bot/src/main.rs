@@ -356,6 +356,9 @@ impl Bot {
                     if let Some(snap) = parse_gamedata(b) {
                         let me = self.me();
                         self.world.apply_snapshot(&snap.records, me);
+                        for id in std::mem::take(&mut self.world.class_requests) {
+                            self.engine.queue(0x2002, id.to_le_bytes().to_vec());
+                        }
                         if snap.page_list != 0 {
                             self.engine.queue(0x2008, ack_body(1, snap.page_list as u32, snap.page_count));
                         }
@@ -465,6 +468,10 @@ impl Bot {
             }
             0x1114 => self.world.set_team(u32_at(b, 0), u16_at(b, 4) as u8),
             0x1005 => self.world.log("we took damage"),
+            0x1100 => {
+                let slot = if b.get(6) == Some(&1) { format!(", player slot {} ({})", u16_at(b, 0xa), self.world.roster.get(&u16_at(b, 0xa)).map_or("not in roster", |s| s.as_str())) } else { String::new() };
+                self.world.log(format!("CLASS INFO {:#010x}: desc slot {}, type {}{slot}", u32_at(b, 0), u16_at(b, 4), b.get(6).copied().unwrap_or(0)));
+            }
             0x1006 => {
                 self.world.log("WE WERE DESTROYED");
                 if self.respawn_delay > 0.0 {

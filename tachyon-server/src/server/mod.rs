@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tachyon_core::mpc::GameType;
+use tachyon_core::net::proto::RecordOut;
 use tachyon_core::net::events::{self as ev};
 use std::rc::Rc;
 use tachyon_core::des::Des;
@@ -38,6 +39,9 @@ const PLAYER_SHIPS: [&str; 11] = [
     "BORA_MACE", "BORA_CUTLASS", "BORA_BATTLEAXE", "BORA_WARHAMMER", "BORA_CLAYMORE", "MAKO",
 ];
 
+/// The highest shield recharge rate a stock client sends: 2.0 in 16.16.
+const MAX_SHIELD_RATE: i32 = 2 << 16;
+
 pub struct Options {
     pub name: String,
     pub password: String,
@@ -47,6 +51,9 @@ pub struct Options {
     pub max_kills: u32,
     /// Round length in minutes (`spacesav[0x61]`, default 30; 0 = untimed).
     pub time_limit_min: u32,
+    /// Print every damage calculation and shield change to the console (`--debug-damage`,
+    /// console `/debug damage`).
+    pub debug_damage: bool,
 }
 
 /// Delivery spec (`NetSrv_QueueEvent`; filter `Tach_SrvEventFilter 0x4620b0`).
@@ -166,7 +173,10 @@ impl Server {
             opts,
             map,
             world: World::new(),
-            conns: (0..slots).map(|_| None).collect(),
+            // Slot 0 is the stock host's own player (Netsock id 0x10000); remote players take
+            // slots 1.., so slot == Netsock id − 0x10000 as the client assumes (roster slot, class
+            // info, private chat target, startup kind 1 all use that one number).
+            conns: (0..=slots).map(|_| None).collect(),
             peers: HashMap::new(),
             session: (seed as u32 & 0xffff) | 1,
             game_frame: 0,
@@ -278,12 +288,16 @@ impl Server {
         c.static_page = c.static_page.wrapping_add(1) | 1;
     }
 
+    pub fn max_players(&self) -> u32 {
+        self.conns.len() as u32 - 1
+    }
+
     pub fn player_count(&self) -> usize {
         self.conns.iter().flatten().count()
     }
 
     fn session_record(&self) -> Vec<u8> {
-        netsock::session_record(&self.opts.name, self.conns.len() as u32, self.player_count() as u32, !self.opts.password.is_empty(),
+        netsock::session_record(&self.opts.name, self.max_players(), self.player_count() as u32, !self.opts.password.is_empty(),
             // The stock host leaves the session GUID zero, and the NovaWorld join path
             // (`NwLaunch_JoinSession`) looks the session up by an all-zero GUID.
             [0; 16])
@@ -324,7 +338,7 @@ impl Server {
                     Some(netsock::REFUSE_GUID)
                 } else if !self.opts.password.is_empty() && password != self.opts.password {
                     Some(netsock::REFUSE_PASSWORD)
-                } else if !self.peers.contains_key(&addr) && self.conns.iter().all(Option::is_some) {
+                } else if !self.peers.contains_key(&addr) && self.conns.iter().skip(1).all(Option::is_some) {
                     Some(netsock::REFUSE_FULL)
                 } else {
                     None
@@ -346,12 +360,12 @@ impl Server {
                     self.send_raw(addr, netsock::create_reply(0, id));
                     return;
                 }
-                let Some(slot) = self.conns.iter().position(Option::is_none) else {
+                let Some(slot) = self.conns.iter().skip(1).position(Option::is_none).map(|i| i + 1) else {
                     self.send_raw(addr, netsock::create_reply(1, 0));
                     return;
                 };
                 // Stock ids: 0x10000 + table slot, with the host's own player in slot 0.
-                let id = netsock::SERVER_PLAYER_ID + 1 + slot as u32;
+                let id = netsock::SERVER_PLAYER_ID + slot as u32;
                 self.peers.get_mut(&addr).unwrap().player = Some(id);
                 self.send_raw(addr, netsock::create_reply(0, id));
                 let data = data.to_vec();
@@ -683,7 +697,9 @@ impl Server {
                 e.net_angles = pd.angles;
             }
             e.target = pd.target;
-            e.power.shield_rate = pd.shield_rate;
+            // DEVIATIONS.md "Shield regen rate": the original takes any value; a stock client
+            // only ever sends 0..2.0 (`Power_StepRate` wraps at 2.0).
+            e.power.shield_rate = if self.opts.original_bugs { pd.shield_rate } else { pd.shield_rate.clamp(0, MAX_SHIELD_RATE) };
             e.throttle = (pd.throttle >> 3) as u8;
         }
     }
@@ -716,6 +732,7 @@ impl Server {
             ev::CL_POWER => self.on_power_op(slot, b),
             ev::CL_COLLISION => self.on_collision(slot, b),
             ev::CL_RESPAWN => self.on_respawn(slot),
+            ev::CL_CLASS_INFO => self.on_class_info_req(slot, b),
             ev::CL_ENTER_WORLD => {
                 if let Some(c) = self.conn_mut(slot) {
                     c.state = 0;
@@ -734,6 +751,20 @@ impl Server {
                 }
             }
         }
+    }
+
+    /// 0x2002 (`TachSrv_OnClassInfoReq`): a client met a record with state flag 0x04 for an
+    /// entity it has no descriptor for. Reply 0x1100 to that player; without it the client never
+    /// builds the replica (`ShipReplica_Init` links it into the render list), so the ship stays
+    /// invisible.
+    fn on_class_info_req(&mut self, slot: u16, b: &[u8]) {
+        let id = proto::u32_at(b, 0);
+        let Some(e) = self.world.get(id) else { return };
+        // Player ships (`LAB_00463690`, desc +0x24 of SHIP). Other classes come with their
+        // entities (starbase parts, AI ships).
+        let Owner::Player(owner) = e.owner else { return };
+        let body = ev::class_info_player(id, e.desc_slot, owner);
+        self.queue(ev::EV_CLASS_INFO, body, Delivery::only(slot));
     }
 
     /// 0x2008 (`TachSrv_OnDataChunk`): kind 1 acks a static page (`Srv_RecvPlayerChunk`), kind 2
@@ -817,6 +848,38 @@ impl Server {
 
     pub fn strip_chat_prefix<'a>(&self, text: &'a str) -> &'a str {
         self.command_text(text).unwrap_or(text.trim_start())
+    }
+
+    /// An entity record as `viewer` (a ship id) receives it. Byte 7 is not the team but the
+    /// rules' `+0x1c` hook, which `MpRules_LoadRegion` replaces with the mode's relation
+    /// function: `DM_GetRelation` gives every player ship 2 (hostile) and anything else 4;
+    /// `BW_GetRelation` gives players 1 (same team) or 2, and others their `race.cfg` relation
+    /// to the viewer (2 hostile, else 4; an allied relation, 1, isn't modelled since
+    /// `race.cfg` lists only enemies). The client colours by this byte.
+    fn record_for(&self, id: u32, viewer: u32, extra_flags: u8, ext: bool) -> RecordOut {
+        let e = self.world.get(id).unwrap();
+        let mut r = e.record(extra_flags, ext);
+        r.team = self.relation(e, viewer);
+        r
+    }
+
+    fn relation(&self, e: &Entity, viewer: u32) -> u8 {
+        let player = matches!(e.owner, Owner::Player(_));
+        match self.map.config.game_type {
+            GameType::Deathmatch => {
+                if player { 2 } else { 4 }
+            }
+            _ => {
+                let mine = self.world.get(viewer).map_or(0, |v| v.team);
+                if player {
+                    if e.team == mine { 1 } else { 2 }
+                } else if self.map.races.hostile(mine as usize, e.team as usize) {
+                    2
+                } else {
+                    4
+                }
+            }
+        }
     }
 
     // ---- tick ----
@@ -979,12 +1042,12 @@ impl Server {
                 sent.push(target);
             }
             for id in &sent {
-                recs.push(self.world.get(*id).unwrap().record(0, false));
+                recs.push(self.record_for(*id, ship, 0, false));
             }
             // Far: two more per snapshot from a cursor over everything within the far radius.
             let far_ids = self.far_records(slot, camera, ship, &sent);
             for id in far_ids {
-                recs.push(self.world.get(id).unwrap().record(proto::REC_FAR, false));
+                recs.push(self.record_for(id, ship, proto::REC_FAR, false));
             }
             // The current static page (`Tach_SrvWritePersistentPage`): 12 records while loading,
             // else 4, repeated until acked. Removed entries count but aren't written.
@@ -994,8 +1057,8 @@ impl Server {
                 let n = (c.static_list.len() - c.static_acked).min(size);
                 page = (c.static_page as u16, n as u16);
                 for id in &c.static_list[c.static_acked..c.static_acked + n] {
-                    if let Some(e) = self.world.get(*id) {
-                        recs.push(e.record(0, true));
+                    if self.world.get(*id).is_some() {
+                        recs.push(self.record_for(*id, ship, 0, true));
                     }
                 }
             }
@@ -1046,7 +1109,7 @@ impl Server {
             self.map.config.name,
             self.map.config.game_type_name,
             self.player_count(),
-            self.conns.len(),
+            self.max_players(),
             self.game_frame
         )];
         for c in self.conns.iter().flatten() {
@@ -1093,7 +1156,7 @@ mod tests {
         let src = AssetSource::open(std::path::Path::new("../../pff")).ok()?;
         let cfg = tachyon_core::mpc::find(&src, map).ok()?;
         let map = Map::load(src, cfg).ok()?;
-        Some(Server::new(Options { name: "t".into(), password: String::new(), max_players: 8, original_bugs: false, max_kills: 20, time_limit_min: 30 }, map, None))
+        Some(Server::new(Options { name: "t".into(), password: String::new(), max_players: 8, original_bugs: false, max_kills: 20, time_limit_min: 30, debug_damage: false }, map, None))
     }
 
     /// A scripted client: acks startup stages, static pages and 0x1007, sends PLAYERDATA at
@@ -1141,8 +1204,13 @@ mod tests {
             Some(Harness { s, c })
         }
 
+        /// Client i's connection (slot i + 1; slot 0 is the stock host's own player).
+        fn conn(&self, i: usize) -> &Conn {
+            self.s.conns[i + 1].as_ref().unwrap()
+        }
+
         fn ship(&self, i: usize) -> u32 {
-            self.s.conns[i].as_ref().unwrap().ship
+            self.conn(i).ship
         }
 
         fn run(&mut self, ticks: usize) {
@@ -1212,7 +1280,7 @@ mod tests {
         fn kill(&mut self, from: usize, to: usize) {
             let target = self.ship(to);
             for _ in 0..40 {
-                if self.s.conns[to].as_ref().unwrap().dead {
+                if self.conn(to).dead {
                     return;
                 }
                 for _ in 0..10 {
@@ -1234,6 +1302,29 @@ mod tests {
         assert!(h.s.conns.iter().flatten().all(|c| !c.in_startup));
         let b = h.ship(1);
         assert!(h.c[0].snaps.iter().any(|s| s.records.iter().any(|r| r.id == b)), "the second player never appeared in the first one's snapshots");
+        // `DM_GetRelation`: other players' records carry 2 (hostile) in the team byte.
+        assert!(h.c[0].snaps.iter().flat_map(|s| s.records.iter()).filter(|r| r.id == b).all(|r| r.team == 2));
+    }
+
+    /// Slots and Netsock ids line up as on the stock host, and 0x2002 for a player ship gets
+    /// the 16-byte class info with that player's slot.
+    #[test]
+    fn class_info_for_player_ships() {
+        let Some(mut h) = Harness::new("DM_01", 2) else { return };
+        h.run(16 * 10);
+        for i in 0..2 {
+            assert_eq!((h.conn(i).slot as usize, h.conn(i).netsock_id), (i + 1, 0x10001 + i as u32));
+        }
+        let other = h.ship(1);
+        h.c[0].out.push((ev::CL_CLASS_INFO, other.to_le_bytes().to_vec()));
+        h.run(48);
+        let r = h.got(0, ev::EV_CLASS_INFO);
+        assert_eq!(r.len(), 1);
+        let desc = h.s.world.get(other).unwrap().desc_slot;
+        assert_eq!(r[0].as_slice(), ev::class_info_player(other, desc, 2).as_slice());
+        assert_eq!((r[0].len(), proto::u16_at(r[0], 0xa)), (16, 2));
+        // The roster entry for that player uses the same slot number.
+        assert!(h.got(0, ev::EV_ROSTER).iter().any(|b| proto::u16_at(b, 0) == 2));
     }
 
     /// 0x2001 is relayed as 0x1002 to the other player, not back to the shooter.
@@ -1255,13 +1346,14 @@ mod tests {
     #[test]
     fn kill_and_respawn() {
         let Some(mut h) = Harness::new("DM_01", 2) else { return };
+        h.s.opts.debug_damage = true; // exercises the debug lines (shown with --nocapture)
         h.run(16 * 10);
         h.kill(0, 1);
         h.run(32);
-        assert!(h.s.conns[1].as_ref().unwrap().dead, "400 heavy laser hits didn't kill");
+        assert!(h.conn(1).dead, "400 heavy laser hits didn't kill");
         assert_eq!(h.got(1, ev::EV_YOU_DIED).len(), 1);
         assert!(!h.got(1, ev::EV_YOU_WERE_HIT).is_empty());
-        assert_eq!((h.s.conns[0].as_ref().unwrap().kills, h.s.conns[1].as_ref().unwrap().deaths), (1, 1));
+        assert_eq!((h.conn(0).kills, h.conn(1).deaths), (1, 1));
         let texts: Vec<String> = h.got(0, ev::EV_TEXT).iter().map(|b| ev::parse_text(b).2).collect();
         assert!(texts.iter().any(|t| t.contains("P0") && t.contains("P1")), "{texts:?}");
         // The dead ship drops out of the killer's snapshots.
@@ -1271,7 +1363,7 @@ mod tests {
         h.c[1].out.push((ev::CL_RESPAWN, vec![0, 0]));
         h.run(48);
         assert_eq!(h.got(1, ev::EV_TELEPORT).len(), 1);
-        assert!(!h.s.conns[1].as_ref().unwrap().dead);
+        assert!(!h.conn(1).dead);
         let e = h.s.world.get(victim).unwrap();
         assert_eq!((e.power.hull, e.power.shield_front, e.net_flags), (e.power.hull_max, e.power.shield_max, 0));
     }
@@ -1283,20 +1375,54 @@ mod tests {
         let Some(mut h) = Harness::new("DM_01", 2) else { return };
         h.s.opts.max_kills = 1;
         h.run(16 * 10);
+        // Client 0 also carries an ammo weapon (21) with 3 of 20 left.
+        assert!(weapons::by_id(21).is_some_and(|d| d.ammo != 0));
+        h.s.conns[1].as_mut().unwrap().mounts[1] = Some((21, 20, 3));
         let session = h.s.session;
         h.kill(0, 1);
         h.run(32);
         for i in 0..2 {
             assert_eq!(h.got(i, ev::EV_ROUND_FREEZE).len(), 1, "client {i}");
         }
-        h.run(rules::FREEZE_TICKS as usize + 64);
+        h.run(rules::FREEZE_TICKS_SHORT as usize + 64);
         assert_eq!(h.s.session, session + 1);
         for i in 0..2 {
             assert_eq!(h.got(i, ev::EV_ENTER_QUADRANT).len(), 1, "client {i}");
             assert_eq!(h.got(i, ev::EV_ROUND_RESUME).len(), 1, "client {i}");
-            let c = h.s.conns[i].as_ref().unwrap();
+            let c = h.conn(i);
             assert_eq!((c.kills, c.deaths, c.dead, c.in_quadrant), (0, 0, false, true));
         }
+        // The client's ammo is refilled too (weapon 6 has none, so only mount 1 is sent).
+        assert_eq!(h.got(0, ev::EV_AMMO), vec![&ev::ammo(1, 20)]);
+        assert!(h.got(1, ev::EV_AMMO).is_empty());
+    }
+
+    /// 0x2011 from a living player is ignored; the round timer pauses during a freeze; the
+    /// minutes-left line arrives on a whole minute.
+    #[test]
+    fn respawn_guard_timer_pause_and_minutes_left() {
+        let Some(mut h) = Harness::new("DM_01", 2) else { return };
+        h.run(16 * 10);
+        h.c[0].out.push((ev::CL_RESPAWN, vec![0, 0]));
+        h.run(48);
+        assert!(h.got(0, ev::EV_TELEPORT).is_empty(), "a living player respawned");
+        // Freeze with the timer about to run out: it must not end the round a second time.
+        h.s.opts.max_kills = 1;
+        h.s.round_ticks = 100;
+        h.kill(0, 1);
+        h.run(200);
+        assert_eq!(h.got(0, ev::EV_ROUND_FREEZE).len(), 1);
+        assert!(h.s.round_ticks > 0 && h.s.round_ticks <= 100);
+        // A dead player's request during the freeze is ignored too.
+        h.c[1].out.push((ev::CL_RESPAWN, vec![0, 0]));
+        h.run(48);
+        assert!(h.got(1, ev::EV_TELEPORT).is_empty());
+        h.run(rules::FREEZE_TICKS_SHORT as usize);
+        // New round: 5 minutes plus a little.
+        h.s.round_ticks = 5 * 3000 + 20;
+        h.run(64);
+        let texts: Vec<String> = h.got(0, ev::EV_TEXT).iter().map(|b| ev::parse_text(b).2).collect();
+        assert!(texts.iter().any(|t| t == "5 MINUTES LEFT IN THIS ROUND"), "{texts:?}");
     }
 
     /// Asteroids reach clients as static pages: 4 extended records per snapshot (12 while
@@ -1311,7 +1437,7 @@ mod tests {
         assert!(paged.len() >= 4 * 20, "{}", paged.len());
         assert!(paged.iter().all(|r| r.desc.is_some_and(|d| d >= 0)));
         assert!(h.c[0].snaps.iter().all(|s| s.page_count <= 4));
-        let c = h.s.conns[0].as_ref().unwrap();
+        let c = h.conn(0);
         assert!(c.static_acked >= 4 * 20 && c.static_acked < total, "{}", c.static_acked);
     }
 }

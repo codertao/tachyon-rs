@@ -24,6 +24,7 @@ const HELP: &[&str] = &[
     "/status                        players and map",
     "/say <text>                    message everyone (console)",
     "/kick <slot>                   drop a player",
+    "/debug damage [on|off]         print damage and shield maths (console)",
     "/ai add <ship> [team] [skill] [count]   (milestone M5)",
     "/ai remove <id|all>, /ai list           (milestone M5)",
     "/quit                          stop the server (console only)",
@@ -51,8 +52,20 @@ pub fn run_command(s: &mut Server, line: &str, from: Option<u16>) -> Vec<String>
             }
             _ => vec!["usage: /kick <slot>".into()],
         },
+        "debug" if from.is_none() => match rest.as_slice() {
+            ["damage", arg @ ..] => {
+                s.opts.debug_damage = match arg.first().map(|a| a.to_ascii_lowercase()) {
+                    Some(a) if a == "on" => true,
+                    Some(a) if a == "off" => false,
+                    _ => !s.opts.debug_damage,
+                };
+                vec![format!("damage debug {}", if s.opts.debug_damage { "on" } else { "off" })]
+            }
+            _ => vec!["usage: /debug damage [on|off]".into()],
+        },
         "ai" => vec!["AI pilots arrive in milestone M5".into()],
         "map" => vec![format!("map {} ({}); switching maps isn't supported yet", s.map.config.name, s.map.config.game_type_name)],
+        "say" | "quit" | "debug" => vec![format!("/{cmd} works only on the server console")],
         _ => vec![format!("unknown command /{cmd} (try /help)")],
     }
 }

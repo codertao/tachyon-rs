@@ -35,11 +35,14 @@ pub struct World {
     track_last: Option<(Instant, [f64; 3])>,
     pub roster: BTreeMap<u16, String>,
     start: Instant,
+    /// Entities first seen with state flag 0x04, which the real client asks the server about
+    /// with 0x2002 (`TachCli_SpawnReplica`); drained by the caller.
+    pub class_requests: Vec<u32>,
 }
 
 impl World {
     pub fn new() -> World {
-        World { entities: BTreeMap::new(), tables: Tables::default(), me: None, track: None, track_last: None, roster: BTreeMap::new(), start: Instant::now() }
+        World { entities: BTreeMap::new(), tables: Tables::default(), me: None, track: None, track_last: None, roster: BTreeMap::new(), start: Instant::now(), class_requests: vec![] }
     }
 
     pub fn log(&self, msg: impl AsRef<str>) {
@@ -53,7 +56,15 @@ impl World {
         if let Some(d) = r.desc {
             s += &format!(" desc={}", self.tables.descs.get(&d).cloned().unwrap_or_else(|| format!("#{d}")));
         }
-        s += &format!(" team={} flags={:#04x}", race(r.team as u32), r.flags);
+        // In multiplayer this byte is the mode's relation to us (1 friendly, 2 hostile, 4
+        // neutral), not the race (`DM_GetRelation` / `BW_GetRelation`).
+        let rel = match r.team {
+            1 => "friendly".to_string(),
+            2 => "hostile".to_string(),
+            4 => "neutral".to_string(),
+            t => format!("{t} ({})", race(t as u32)),
+        };
+        s += &format!(" rel={rel} flags={:#04x}", r.flags);
         s
     }
 
@@ -107,6 +118,9 @@ impl World {
         let range = dist(r.pos, from);
         let Some(e) = self.entities.get_mut(&r.id) else {
             self.log(format!("{verb}{:#010x} {} at {} dist={range:.0}", r.id, self.describe(&r), fmt(r.pos)));
+            if r.flags & 0x04 != 0 {
+                self.class_requests.push(r.id);
+            }
             self.entities.insert(r.id, Entity { rec: r, seen: now, life });
             return;
         };

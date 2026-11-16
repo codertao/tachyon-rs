@@ -4,8 +4,10 @@
 
 use super::*;
 
-/// `Round_FreezeTicks` with `DAT_005b2b18` unset: 1000 ticks (20 s).
+/// `Round_FreezeTicks` with `DAT_005b2b18` unset: 1000 ticks (20 s). This server defaults to half
+/// that (DEVIATIONS.md "Round freeze"); `--original-bugs` keeps 1000.
 pub const FREEZE_TICKS: u32 = 1000;
+pub const FREEZE_TICKS_SHORT: u32 = 500;
 /// Ticks per minute at 50 Hz (`spacesav[0x61]` × 3000).
 const TICKS_PER_MINUTE: u32 = 3000;
 
@@ -33,7 +35,7 @@ impl Server {
         for c in self.conns.iter_mut().flatten() {
             c.dead = true;
         }
-        self.freeze_ticks = FREEZE_TICKS;
+        self.freeze_ticks = if self.opts.original_bugs { FREEZE_TICKS } else { FREEZE_TICKS_SHORT };
         println!("round over");
         for line in self.status_lines(false).into_iter().skip(1) {
             println!("{line}");
@@ -48,15 +50,36 @@ impl Server {
                 self.next_round();
             }
         }
-        if self.round_ticks != 0 {
+        // DEVIATIONS.md "Round timer": the original keeps counting through a kill-limit
+        // freeze, so a timer that runs out then freezes the round a second time.
+        if self.round_ticks != 0 && (self.freeze_ticks == 0 || self.opts.original_bugs) {
             self.round_ticks -= 1;
             if self.round_ticks == 0 {
                 // `DM_EndRound`.
                 self.scoreboard();
                 self.round_freeze();
             }
-            // `DM_MsgMinutesLeft` would announce "%d MINUTES LEFT IN THIS ROUND", but its test
-            // (minutes % 3000 == 0, minutes >= 5) never passes, so the stock host is silent.
+            self.minutes_left_msg();
+        }
+    }
+
+    /// `DM_MsgMinutesLeft`: "%d MINUTES LEFT IN THIS ROUND" on each whole minute while 5 or
+    /// more are left. The original divides by 3000 twice (minutes % 3000 instead of ticks %
+    /// 3000), so the test never passes and the stock host stays silent. DEVIATIONS.md
+    /// "Minutes left".
+    fn minutes_left_msg(&mut self) {
+        let t = self.round_ticks;
+        let due = if self.opts.original_bugs {
+            let m = t / TICKS_PER_MINUTE;
+            m > 4 && m % TICKS_PER_MINUTE == 0
+        } else {
+            t != 0 && t % TICKS_PER_MINUTE == 0 && t / TICKS_PER_MINUTE > 4
+        };
+        if due {
+            // Colour: the `DAT_005a6320` table's byte 1, which is filled at run time; info
+            // colour assumed.
+            let text = format!("{} MINUTES LEFT IN THIS ROUND", t / TICKS_PER_MINUTE);
+            self.text_to(Delivery::all(), ev::COLOR_INFO, &text);
         }
     }
 
@@ -100,6 +123,18 @@ impl Server {
             self.build_static_list(slot);
             self.queue(ev::EV_ENTER_QUADRANT, ev::enter_quadrant(pos, angles, quadrant, 1, 1, &bdf), Delivery::only(slot));
             self.init_ship_power(slot);
+            if !self.opts.original_bugs {
+                // DEVIATIONS.md "Ammo at round start": the original refills the server's counts
+                // only, so the client keeps whatever it had left.
+                let mounts = self.conn(slot).map(|c| c.mounts).unwrap_or_default();
+                for (i, m) in mounts.iter().enumerate() {
+                    if let Some((w, _, ammo)) = m
+                        && weapons::by_id(*w).is_some_and(|d| d.ammo != 0)
+                    {
+                        self.queue(ev::EV_AMMO, ev::ammo(i as u16, *ammo), Delivery::only(slot));
+                    }
+                }
+            }
         }
         self.scoreboard();
     }
