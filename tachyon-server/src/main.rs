@@ -28,6 +28,8 @@ options:
   --password <s>        session password
   --original-bugs       reproduce the original host's known bugs (see DEVIATIONS.md)
   --log-packets <file>  write every packet in and out to <file>
+  --log-detail          with --log-packets: add what each message means (positions, records,
+                        events) and dump bodies in full
   --join-page <host[:port]>
                         print a Startup.htm that makes a stock client join this server from
                         the Network (NovaWorld) screen, then exit (port defaults to --port)
@@ -44,6 +46,7 @@ pub struct Args {
     pub password: String,
     pub original_bugs: bool,
     pub log_packets: Option<PathBuf>,
+    pub log_detail: bool,
     pub join_page: Option<String>,
 }
 
@@ -58,6 +61,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args> {
         password: String::new(),
         original_bugs: false,
         log_packets: None,
+        log_detail: false,
         join_page: None,
     };
     let mut assets = None;
@@ -73,6 +77,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args> {
             "--password" => a.password = val()?,
             "--original-bugs" => a.original_bugs = true,
             "--log-packets" => a.log_packets = Some(PathBuf::from(val()?)),
+            "--log-detail" => a.log_detail = true,
             "--join-page" => a.join_page = Some(val()?),
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -83,6 +88,9 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args> {
     }
     if a.join_page.is_some() {
         return Ok(a);
+    }
+    if a.log_detail && a.log_packets.is_none() {
+        bail!("--log-detail needs --log-packets <file>");
     }
     a.assets = assets.ok_or_else(|| anyhow!("--assets is required\n\n{USAGE}"))?;
     if !a.list_maps && a.map.is_none() {
@@ -124,7 +132,7 @@ fn main() -> Result<()> {
     }
     println!("{}", map.summary());
     let log = match &args.log_packets {
-        Some(p) => Some(packetlog::PacketLog::create(p).with_context(|| format!("creating {}", p.display()))?),
+        Some(p) => Some(packetlog::PacketLog::create(p, args.log_detail).with_context(|| format!("creating {}", p.display()))?),
         None => None,
     };
     let opts = server::Options {
@@ -219,5 +227,7 @@ mod tests {
         assert!(args("--map DM_01").is_err());
         assert!(args("--assets x --list-maps").unwrap().list_maps);
         assert!(args("--assets x --map a --bogus").is_err());
+        assert!(args("--assets x --map a --log-detail").is_err());
+        assert!(args("--assets x --map a --log-packets p.log --log-detail").unwrap().log_detail);
     }
 }

@@ -5,4 +5,5 @@ pub mod events;
 pub mod novaworld;
 pub mod packet;
 pub mod proto;
+pub mod describe;
 pub mod startup;

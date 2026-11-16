@@ -16,7 +16,17 @@ cargo run --release -p tachyon-server -- --assets /path/to/Tachyon.pff --map DM_
 ```
 
 Options: `--port` (default 2766, the port the game's Network screen uses), `--name`,
-`--max-players`, `--password`, `--original-bugs`, `--log-packets <file>`.
+`--max-players`, `--password`, `--original-bugs`, `--log-packets <file>`, `--log-detail`.
+
+`--log-packets` writes every engine packet in and out with a hex dump. Adding `--log-detail`
+also writes what each message means, under the message, and dumps bodies in full. For example:
+
+```
+    2.150 <- slot 0: seq 4 ack 3, 114 bytes
+            0x0003 PLAYERDATA [88]
+              = player 0x10001, client frame 156, session 41547
+              = ship at (-1943, 625, -1500) vel (-0.1, 0.0, 4.7) (4.7 u/tick) angles [356°, 0°, 0°] throttle 512/1024
+```
 
 Console: `/status`, `/kick <slot>`, `/say <text>` (or just type a line), `/quit`. Players can use
 `/status` and `/help` from in-game chat.
