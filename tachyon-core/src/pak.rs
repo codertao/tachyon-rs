@@ -220,6 +220,24 @@ impl Pak {
 }
 
 impl Pak {
+    /// `Model_ComputeRadius` at unit scale (what `Pak_Load` stores at model `+0x30`): the
+    /// farthest LOD-0 vertex from the origin. Part 0 sits at the origin and every other part is
+    /// its child at the root mesh's pivot (`Pak_Relocate`); part rotations are ignored.
+    pub fn radius(&self) -> f32 {
+        let Some(lod) = self.lods.first() else { return 0.0 };
+        let root = lod.parts.first().and_then(|p| self.meshes.get(&p.mesh_ofs));
+        let mut r2 = 0f32;
+        for (i, part) in lod.parts.iter().enumerate() {
+            let Some(mesh) = self.meshes.get(&part.mesh_ofs) else { continue };
+            let base = if i == 0 { [0.0; 3] } else { root.and_then(|m| m.pivots.get(i - 1)).copied().unwrap_or([0.0; 3]) };
+            for v in &mesh.positions {
+                let d: f32 = (0..3).map(|k| (v[k] + base[k]).powi(2)).sum();
+                r2 = r2.max(d);
+            }
+        }
+        r2.sqrt()
+    }
+
     /// LOD 0's root mesh (what `Model_GetLod0Mesh` returns), used for OCF attach points.
     pub fn lod0_root_mesh(&self) -> Option<&Mesh> {
         let p = self.lods.first()?.parts.first()?;
@@ -518,5 +536,22 @@ mod tests {
         }
         assert!(bad.is_empty(), "{} failures: {:?}", bad.len(), &bad[..bad.len().min(10)]);
         assert_eq!(ok, 1160);
+    }
+}
+
+#[cfg(test)]
+mod radius_tests {
+    /// The computed radius stays close to the exporter's header radius (`+0x30`).
+    #[test]
+    fn radius_close_to_header() {
+        let Ok(src) = crate::source::AssetSource::open(std::path::Path::new("../../pff")) else { return };
+        for name in ["cutlaser.pak", "torpblst.pak", "misstigr.pak", "ast1.pak", "stargate.pak"] {
+            let Ok(raw) = src.read(name) else { continue };
+            let pak = super::parse(&raw).unwrap();
+            let header = i32::from_le_bytes(raw[0x30..0x34].try_into().unwrap()) as f32 / 65536.0;
+            let r = pak.radius();
+            println!("{name}: computed {r:.2} header {header:.2}");
+            assert!(r > 0.0 && (r - header).abs() <= header * 0.5 + 1.0, "{name}: {r} vs {header}");
+        }
     }
 }

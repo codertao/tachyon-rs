@@ -29,6 +29,9 @@ const USAGE: &str = "usage: tachyon-bot <host[:port]> [options]
   --weapon N         weapon type to fire (default 6)
   --fire-every S     seconds between shots (default 3; 0 = never fire)
   --muzzle U         start shots U world units ahead of the ship's centre (default 12)
+  --missile N        also fire guided weapon N (8-15, 22) via 0x2004, locked on the --track
+                     id if given (else unlocked), from loadout slot 1
+  --missile-every S  seconds between missiles (default 10)
   --respawn S        seconds to wait before respawning after death (default 5; 0 = never)
   --track ID         log every snapshot record of entity ID (hex)
   --say <text>       send this chat line (0x2022, to all) once startup completes; repeatable
@@ -49,6 +52,8 @@ struct Args {
     weapon: u8,
     fire_every: f64,
     muzzle: f64,
+    missile: Option<u8>,
+    missile_every: f64,
     track: Option<u32>,
     verbose: bool,
     say: Vec<String>,
@@ -72,6 +77,8 @@ fn parse_args() -> Result<Args> {
         weapon: 6,
         fire_every: 3.0,
         muzzle: 12.0,
+        missile: None,
+        missile_every: 10.0,
         track: None,
         verbose: false,
         say: vec![],
@@ -101,6 +108,8 @@ fn parse_args() -> Result<Args> {
             "--weapon" => a.weapon = val()?.parse()?,
             "--fire-every" => a.fire_every = val()?.parse()?,
             "--muzzle" => a.muzzle = val()?.parse()?,
+            "--missile" => a.missile = Some(val()?.parse()?),
+            "--missile-every" => a.missile_every = val()?.parse()?,
             "--respawn" => a.respawn = val()?.parse()?,
             "--track" => a.track = Some(u32::from_str_radix(val()?.trim_start_matches("0x"), 16)?),
             "--say" => a.say.push(val()?),
@@ -312,6 +321,9 @@ struct Bot {
     respawn_delay: f64,
     kicked: Option<u8>,
     weapon: u8,
+    missile: Option<u8>,
+    /// The last snapshot had the incoming-missile flag (status one-shot bit 0).
+    warned: bool,
     armed: bool,
     /// Highest server frame seen in PLAYERINFO (`FUN_00417e50` keeps the same max in
     /// `DAT_005b39cc`); receivers age 0x1002 shots against it.
@@ -354,6 +366,11 @@ impl Bot {
                 }
                 Sub::GameData(b) => {
                     if let Some(snap) = parse_gamedata(b) {
+                        let warned = snap.one_shot_flags & 1 != 0;
+                        if warned && !self.warned {
+                            self.world.log("incoming missile warning");
+                        }
+                        self.warned = warned;
                         let me = self.me();
                         self.world.apply_snapshot(&snap.records, me);
                         for id in std::mem::take(&mut self.world.class_requests) {
@@ -438,7 +455,11 @@ impl Bot {
                 // The server only relays a shot if the slot holds a weapon with ammo
                 // (`TachSrv_OnFire`), and the join blob path leaves the ammo counter at 0, so
                 // send a loadout (0x2028, applied as sent by `FUN_004607b0`).
-                self.engine.queue(0x2028, loadout_body(0, &[(self.weapon, 30000)]));
+                let mut slots = vec![(self.weapon, 30000)];
+                if let Some(m) = self.missile {
+                    slots.push((m, 100));
+                }
+                self.engine.queue(0x2028, loadout_body(0, &slots));
                 self.armed = true;
             }
             0x1007 => {
@@ -468,6 +489,9 @@ impl Bot {
             }
             0x1114 => self.world.set_team(u32_at(b, 0), u16_at(b, 4) as u8),
             0x1005 => self.world.log("we took damage"),
+            0x1014 if u16_at(b, 0) == 8 => self.world.remove(u32_at(b, 4), "removed (0x1014 op 8)"),
+            0x1008 => self.world.log(format!("blast of weapon {} at {}", u16_at(b, 12), fmt(vec3_at(b, 0)))),
+            0x1104 => self.world.log(format!("decoy dropped at {}", fmt(vec3_at(b, 0)))),
             0x1100 => {
                 // The layout depends on the class: 6 bytes plain (powerups), 16 for ships
                 // (type @6, roster slot @0xa), 0x10 + 2n for starbases (part @6, dock @8,
@@ -627,6 +651,8 @@ fn main() -> Result<()> {
         respawn_delay: a.respawn,
         kicked: None,
         weapon: a.weapon,
+        missile: a.missile,
+        warned: false,
         armed: false,
         server_frame: 0,
     };
@@ -674,6 +700,24 @@ fn main() -> Result<()> {
             if a.verbose {
                 //bot.world.log(format!("fired weapon {}", a.weapon));
             }
+        }
+        let missile_ticks = (a.missile_every * 50.0) as u64;
+        if let Some(w) = a.missile
+            && bot.armed
+            && bot.circle.active()
+            && missile_ticks > 0
+            && ticks % missile_ticks == missile_ticks / 2
+        {
+            let target = a.track.unwrap_or(0);
+            // Aim at the target when we can see it (a real client fires along its nose, and a
+            // target more than 45 degrees off breaks the lock at once).
+            let angles = match bot.world.entities.get(&target) {
+                Some(e) => tachyon_core::math::dir_angles(ship.pos, e.rec.pos.map(|v| (v * UNIT) as i32)),
+                None => ship.angles,
+            };
+            let f = tachyon_core::net::events::FireGuided { pos: ship.pos, angles, offset: [0; 3], client_frame: bot.engine.frame, target, weapon: w, volume: 0x80, lock: (target != 0) as u8, slot: 1 };
+            bot.engine.queue(0x2004, tachyon_core::net::events::fire_guided(&f));
+            bot.world.log(format!("fired missile {w} at {target:#x}"));
         }
         if bot.circle.active() {
             ship = bot.circle.tick();

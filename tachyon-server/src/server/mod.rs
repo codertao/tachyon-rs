@@ -3,6 +3,7 @@
 //! References: `decomp/notes/multiplayer.md`, especially "Server-side startup details".
 
 mod combat;
+mod missiles;
 mod objects;
 mod rules;
 
@@ -123,10 +124,15 @@ pub struct Conn {
     pub mounts: [Option<(u8, u16, u16)>; 8],
     pub portrait: i16,
     chat_flood: i32,
+    /// GAMEDATA one-shot flags for the next packet (bit 0: incoming missile).
+    one_shot: u32,
     pub kills: u16,
     pub deaths: u16,
     far_list: Vec<u32>,
     far_cursor: Option<usize>,
+    /// Ids sent as normal (life 1) records in the last snapshot; see DEVIATIONS.md "Near-set
+    /// drop-outs".
+    last_near: Vec<u32>,
     /// conn +0x1d0: dead or frozen; takes no damage.
     pub dead: bool,
     /// conn `inQuadrant`: snapshots carry records only while set. Cleared by 0x1007, set
@@ -167,9 +173,17 @@ pub struct Server {
     /// Powerup entities.
     pub pickups: HashMap<u32, objects::Pickup>,
     /// Part offsets per OCF file, computed once.
-    part_offsets: HashMap<String, Vec<[f32; 3]>>,
+    part_offsets: HashMap<String, Vec<([f32; 3], f32)>>,
     /// Class info after `{id, descSlot}` for gates, beacons, mines and speed rings.
     pub class_tails: HashMap<u32, Vec<u8>>,
+    /// Server-owned missiles and blasts by entity id, and the live decoys (`missiles.rs`).
+    pub missiles: HashMap<u32, missiles::Missile>,
+    pub decoys: Vec<missiles::Decoy>,
+    missile_serial: u32,
+    /// Model radius per pool slot (16.16), loaded on demand.
+    model_radii: HashMap<u8, i64>,
+    /// The `weapon_desc` descriptor missile entities carry.
+    weapon_des: std::rc::Rc<Des>,
 }
 
 fn now_seed() -> u64 {
@@ -202,6 +216,11 @@ impl Server {
             pickups: HashMap::new(),
             part_offsets: HashMap::new(),
             class_tails: HashMap::new(),
+            missiles: HashMap::new(),
+            decoys: vec![],
+            missile_serial: 0,
+            model_radii: HashMap::new(),
+            weapon_des: std::rc::Rc::new(Des { file: crate::world::WEAPON_DESC.into(), desc_type: "WEAPON".into(), ..Default::default() }),
         };
         s.load_world();
         s.start_round_timer();
@@ -290,6 +309,7 @@ impl Server {
         for id in statics {
             self.world.remove(id);
         }
+        self.clear_missiles();
         self.bases.clear();
         self.pickups.clear();
         self.class_tails.clear();
@@ -552,10 +572,12 @@ impl Server {
             mounts: [None; 8],
             portrait: -1,
             chat_flood: 0,
+            one_shot: 0,
             kills: 0,
             deaths: 0,
             far_list: vec![],
             far_cursor: None,
+            last_near: vec![],
             dead: false,
             in_quadrant: true,
             static_list: vec![],
@@ -782,6 +804,8 @@ impl Server {
             }
             ev::CL_QUADRANT_ENTERED => {}
             ev::CL_LOADOUT => self.on_loadout(slot, b),
+            ev::CL_FIRE_GUIDED => self.on_fire_guided(slot, b),
+            ev::CL_DECOY => self.on_decoy(slot, b),
             _ => {
                 if let Some(l) = &mut self.log {
                     l.note(&format!("slot {slot}: unhandled event {kind:#06x} ({} bytes)", b.len()));
@@ -927,6 +951,7 @@ impl Server {
         self.round_tick();
         self.regen();
         self.pickups_tick();
+        self.missiles_tick();
         // Per-player think: smoothing filter.
         let ids: Vec<u32> = self.world.order.clone();
         for id in ids {
@@ -1054,8 +1079,10 @@ impl Server {
             let c = self.conn(slot).unwrap();
             (c.camera, c.ship, c.state, c.in_quadrant)
         };
+        // One-shot flags (bit 0: a missile is homing on you) go out once, then clear.
+        let one_shot = self.conn_mut(slot).map_or(0, |c| std::mem::take(&mut c.one_shot));
         let me = self.world.get(ship);
-        let mut status = StatusOut { target_meters: [0xff; 3], ..Default::default() };
+        let mut status = StatusOut { target_meters: [0xff; 3], one_shot_flags: one_shot, ..Default::default() };
         let mut target = 0;
         if let Some(e) = me {
             status.shield_front = e.power.shield_front.clamp(0, 0xffff) as u16;
@@ -1068,6 +1095,10 @@ impl Server {
         }
         let mut recs = vec![];
         let mut page = (0u16, 0u16);
+        if state == 1 || !in_quadrant {
+            // The client drops its replicas on quadrant entry; start the near set afresh.
+            self.conn_mut(slot).unwrap().last_near.clear();
+        }
         if state != 1 && in_quadrant {
             let visible = |e: &Entity| e.id != ship && e.net_flags & 1 == 0;
             // Near: within the near radius, at most 8 (2 while loading).
@@ -1084,8 +1115,22 @@ impl Server {
             for id in &sent {
                 recs.push(self.record_for(*id, ship, 0, false));
             }
+            // A normal record gives the client replica a life of 1, so one that drops out of the
+            // near set is deleted two snapshots later unless the far cursor happens to reach it.
+            // Send it once as a far record instead (62-snapshot life), so it dead-reckons until
+            // the cursor refreshes it. The original host doesn't do this.
+            let mut dropped = vec![];
+            if !self.opts.original_bugs {
+                let last = std::mem::take(&mut self.conn_mut(slot).unwrap().last_near);
+                dropped = last.into_iter().filter(|id| !sent.contains(id) && self.world.get(*id).is_some_and(|e| visible(e) && distance(camera, e.pos) < FAR_RADIUS)).collect();
+                for id in &dropped {
+                    recs.push(self.record_for(*id, ship, proto::REC_FAR, false));
+                }
+                self.conn_mut(slot).unwrap().last_near = sent.clone();
+            }
             // Far: two more per snapshot from a cursor over everything within the far radius.
-            let far_ids = self.far_records(slot, camera, ship, &sent);
+            let skip: Vec<u32> = sent.iter().chain(&dropped).copied().collect();
+            let far_ids = self.far_records(slot, camera, ship, &skip);
             for id in far_ids {
                 recs.push(self.record_for(id, ship, proto::REC_FAR, false));
             }
@@ -1196,7 +1241,7 @@ mod tests {
         let src = AssetSource::open(std::path::Path::new("../../pff")).ok()?;
         let cfg = tachyon_core::mpc::find(&src, map).ok()?;
         let map = Map::load(src, cfg).ok()?;
-        Some(Server::new(Options { name: "t".into(), password: String::new(), max_players: 8, original_bugs: false, max_kills: 20, time_limit_min: 30, debug_damage: false, powerups: true }, map, None))
+        Some(Server::new(Options { name: "t".into(), password: String::new(), max_players: 16, original_bugs: false, max_kills: 20, time_limit_min: 30, debug_damage: false, powerups: true }, map, None))
     }
 
     /// A scripted client: acks startup stages, static pages and 0x1007, sends PLAYERDATA at
@@ -1365,6 +1410,126 @@ mod tests {
         assert_eq!((r[0].len(), proto::u16_at(r[0], 0xa)), (16, 2));
         // The roster entry for that player uses the same slot number.
         assert!(h.got(0, ev::EV_ROSTER).iter().any(|b| proto::u16_at(b, 0) == 2));
+    }
+
+    /// Puts client 1 `dist` units in front (+z) of client 0, gives client 0 `weapon` in mount
+    /// 1 and fires it (angles 0 = nose along +z) with a lock on client 1 if `lock`.
+    fn fire_missile(h: &mut Harness, weapon: u8, dist: i32, lock: bool) {
+        let p0 = h.c[0].pos;
+        h.c[1].pos = [p0[0], p0[1], p0[2] + (dist << 16)];
+        h.run(32);
+        let ammo = weapons::by_id(weapon).unwrap().ammo as u16;
+        h.s.conns[1].as_mut().unwrap().mounts[1] = Some((weapon, ammo, ammo));
+        let f = ev::FireGuided { pos: p0, client_frame: h.conn(0).client_frame, target: if lock { h.ship(1) } else { 0 }, weapon, volume: 0x80, lock: lock as u8, slot: 1, ..Default::default() };
+        h.c[0].out.push((ev::CL_FIRE_GUIDED, ev::fire_guided(&f)));
+    }
+
+    fn removed(h: &Harness, i: usize) -> Vec<u32> {
+        h.got(i, ev::EV_ENTITY_OP).iter().filter(|b| proto::u16_at(b, 0) == ev::OP_REMOVE).map(|b| proto::u32_at(b, 4)).collect()
+    }
+
+    /// A Hunter torpedo locked on client 1 flies as a snapshot entity (state 6, throttle =
+    /// weapon, model = its pool slot), warns the target, hits it, and is removed with 0x1014
+    /// op 8.
+    #[test]
+    fn guided_missile_hits_its_target() {
+        let Some(mut h) = Harness::new("DM_01", 2) else { return };
+        h.run(16 * 10);
+        fire_missile(&mut h, 8, 150, true);
+        h.run(20);
+        let (&id, m) = h.s.missiles.iter().next().expect("no missile");
+        assert_eq!((m.target, m.shooter), (h.ship(1), h.ship(0)));
+        let pw = |h: &Harness| { let p = h.s.world.get(h.ship(1)).unwrap().power; (p.shield_front, p.shield_rear, p.hull) };
+        let hull = pw(&h);
+        h.run(200);
+        assert!(h.s.missiles.is_empty(), "still flying");
+        let rec = h.c[1].snaps.iter().flat_map(|s| s.records.iter()).find(|r| r.id == id).expect("never in a snapshot");
+        assert_eq!((rec.flags & 6, rec.throttle, rec.model), (6, 8, 0));
+        assert!(h.c[1].snaps.iter().any(|s| s.one_shot_flags & 1 != 0), "no missile warning");
+        assert!(!h.c[0].snaps.iter().any(|s| s.one_shot_flags & 1 != 0));
+        assert!(!h.got(1, ev::EV_YOU_WERE_HIT).is_empty(), "never hit");
+        assert_ne!(pw(&h), hull);
+        assert_eq!(removed(&h, 0), vec![id]);
+        assert_eq!(removed(&h, 1), vec![id]);
+        // Class info for the missile: {id, 0, target}.
+        assert_eq!(ev::class_info_missile(id, 0, 7).len(), 0xc);
+    }
+
+    /// An unguided Blast torpedo's proximity fuse turns it into a damage sphere: 0x1008, then
+    /// damage over time, no 0x1014 (it already left the snapshots), then it's freed.
+    #[test]
+    fn blast_torpedo_detonates_near_a_ship() {
+        let Some(mut h) = Harness::new("DM_01", 2) else { return };
+        h.run(16 * 10);
+        fire_missile(&mut h, 9, 160, false);
+        let pw = |h: &Harness| { let p = h.s.world.get(h.ship(1)).unwrap().power; (p.shield_front, p.shield_rear, p.hull) };
+        h.run(4);
+        let before = pw(&h);
+        h.run(150);
+        let blasts = h.got(1, ev::EV_BLAST);
+        assert_eq!(blasts.len(), 1, "no 0x1008");
+        assert_eq!(proto::u16_at(blasts[0], 12), 9);
+        h.run(400);
+        assert!(h.s.missiles.is_empty(), "blast never faded");
+        assert!(removed(&h, 1).is_empty());
+        assert_ne!(pw(&h), before, "the blast did no damage");
+    }
+
+    /// A hit report against a missile destroys it: 0x1003 effect 1, then 0x1014 op 8. Firing
+    /// used one round.
+    #[test]
+    fn missiles_can_be_shot_down() {
+        let Some(mut h) = Harness::new("DM_01", 2) else { return };
+        h.run(16 * 10);
+        fire_missile(&mut h, 12, 1000, true);
+        h.run(20);
+        let id = *h.s.missiles.keys().next().expect("no missile");
+        assert_eq!(h.conn(0).mounts[1].unwrap().2, 11);
+        let pos = h.s.world.get(id).unwrap().pos;
+        let hit = ev::Hit { pos, target: id, weapon: 2, kind: 2, scale: 0x10000, part: None };
+        h.c[1].out.push((ev::CL_HIT, ev::hit(&hit)));
+        h.run(48);
+        assert!(h.s.missiles.is_empty());
+        assert!(h.got(0, ev::EV_DESTROYED).iter().any(|b| b[0x14] == 1), "no effect-1 explosion");
+        assert_eq!(removed(&h, 0), vec![id]);
+    }
+
+    /// 0x2020 is relayed as 0x1104 to the others (not the dropper), and a decoy right in front
+    /// of a locked missile breaks the lock.
+    #[test]
+    fn decoys_relay_and_break_locks() {
+        let Some(mut h) = Harness::new("DM_01", 2) else { return };
+        h.run(16 * 10);
+        fire_missile(&mut h, 12, 600, true);
+        h.run(16);
+        let id = *h.s.missiles.keys().next().unwrap();
+        let p0 = h.c[0].pos;
+        let decoy = [p0[0], p0[1], p0[2] - (50 << 16)];
+        h.c[1].out.push((ev::CL_DECOY, ev::decoy(decoy)));
+        h.run(48);
+        assert_eq!(h.got(0, ev::EV_DECOY).len(), 1);
+        assert!(h.got(1, ev::EV_DECOY).is_empty());
+        assert_eq!(ev::parse_vec3(h.got(0, ev::EV_DECOY)[0]), decoy);
+        assert_eq!(h.s.decoys.len(), 1);
+        assert_eq!(h.s.missiles.get(&id).map(|m| m.target), Some(h.ship(1)), "a decoy far behind broke the lock");
+        // One 100 units ahead of the nose is seen within the next 32 frames.
+        let mp = h.s.world.get(id).unwrap().pos;
+        h.s.decoys.push(missiles::Decoy { pos: [mp[0], mp[1], mp[2] + (100 << 16)], ticks: 250 });
+        h.run(32);
+        assert_eq!(h.s.missiles.get(&id).map(|m| m.target), Some(0), "decoy ignored");
+    }
+
+    /// A round reset clears missiles and decoys.
+    #[test]
+    fn round_reset_clears_missiles() {
+        let Some(mut h) = Harness::new("DM_01", 2) else { return };
+        h.run(16 * 10);
+        fire_missile(&mut h, 12, 1000, true);
+        h.run(20);
+        assert_eq!(h.s.missiles.len(), 1);
+        let id = *h.s.missiles.keys().next().unwrap();
+        h.s.respawn_statics();
+        assert!(h.s.missiles.is_empty() && h.s.world.get(id).is_none());
     }
 
     /// 0x2001 is relayed as 0x1002 to the other player, not back to the shooter.
@@ -1604,5 +1769,31 @@ mod tests {
         assert!(h.c[0].snaps.iter().all(|s| s.page_count <= 4));
         let c = h.conn(0);
         assert!(c.static_acked >= 4 * 20 && c.static_acked < total, "{}", c.static_acked);
+    }
+
+    /// Ten players within the near radius of player 0; player 1 then moves out to the edge of
+    /// it, behind the others, so it falls out of player 0's nearest 8. Every id that leaves the
+    /// near set must come back in the very next snapshot as a far record.
+    #[test]
+    fn near_set_dropouts_get_a_far_record() {
+        let Some(mut h) = Harness::new("DM_01", 16) else { return };
+        h.run(16 * 12);
+        assert!(h.s.conns.iter().flatten().all(|c| !c.in_startup));
+        // Include the last snapshot before the move: the drop shows up in the first one after it.
+        let start = h.c[0].snaps.len() - 1;
+        h.c[3].pos[2] = 5600 << 16;
+        h.run(16 * 6);
+        let snaps = &h.c[0].snaps[start..];
+        let near = |s: &Snapshot| -> Vec<u32> { s.records.iter().filter(|r| r.flags & (proto::REC_FAR | proto::REC_PAGED) == 0).map(|r| r.id).collect() };
+        let mut drops = 0;
+        for w in snaps.windows(2) {
+            let (a, b) = (near(&w[0]), near(&w[1]));
+            for id in a.iter().filter(|id| !b.contains(id) && h.s.world.get(**id).is_some()) {
+                drops += 1;
+                assert!(w[1].records.iter().any(|r| r.id == *id && r.flags & proto::REC_FAR != 0), "{id} left the near set without a far record");
+            }
+        }
+        let p1 = h.ship(3);
+        assert!(drops > 0 && snaps.iter().any(|s| s.records.iter().any(|r| r.id == p1 && r.flags & proto::REC_FAR != 0)), "player 3 never dropped out ({drops} drops)");
     }
 }

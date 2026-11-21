@@ -62,6 +62,8 @@ pub struct BasePart {
     pub alive: bool,
     /// World position (16.16), for the explosion when it dies.
     pub pos: [i32; 3],
+    /// Model radius in units (pak radius × part scale), for server weapon hit tests.
+    pub radius: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -93,8 +95,8 @@ impl Pickup {
 }
 
 /// Every part's offset from the root in model units, root orientation not applied
-/// (`BaseFile_ComputePartTransforms`).
-fn part_offsets(src: &AssetSource, ocf: &Ocf) -> Vec<[f32; 3]> {
+/// (`BaseFile_ComputePartTransforms`), and its model radius × part scale.
+fn part_offsets(src: &AssetSource, ocf: &Ocf) -> Vec<([f32; 3], f32)> {
     let mut paks = std::collections::HashMap::new();
     for p in &ocf.parts {
         let key = p.pak_file.to_uppercase();
@@ -109,7 +111,10 @@ fn part_offsets(src: &AssetSource, ocf: &Ocf) -> Vec<[f32; 3]> {
     let mut it = placed.into_iter();
     ocf.parts
         .iter()
-        .map(|p| if paks.contains_key(&p.pak_file.to_uppercase()) { it.next().map_or([0.0; 3], |pl| pl.offset) } else { [0.0; 3] })
+        .map(|p| match paks.get(&p.pak_file.to_uppercase()) {
+            Some(pak) => (it.next().map_or([0.0; 3], |pl| pl.offset), pak.radius() * p.scale),
+            None => ([0.0; 3], 0.0),
+        })
         .collect()
 }
 
@@ -147,8 +152,9 @@ impl Server {
                 } else {
                     20_000
                 });
-                let off = rot.mul_vec(offsets.get(i).copied().unwrap_or([0.0; 3]));
-                BasePart { index: i as u16, flags, hp, alive: true, pos: std::array::from_fn(|k| pos[k].wrapping_add((off[k] * 65536.0) as i32)) }
+                let (off, radius) = offsets.get(i).copied().unwrap_or(([0.0; 3], 0.0));
+                let off = rot.mul_vec(off);
+                BasePart { index: i as u16, flags, hp, alive: true, pos: std::array::from_fn(|k| pos[k].wrapping_add((off[k] * 65536.0) as i32)), radius }
             })
             .collect();
         // Team: placement +0x38 low byte − 1, or the `.des` race when 0.
@@ -251,6 +257,8 @@ impl Server {
             ev::class_info_base(id, desc_slot, 0, b.dock_state, &b.removed)
         } else if self.pickups.contains_key(&id) {
             ev::class_info_plain(id, desc_slot)
+        } else if let Some(b) = self.missile_class_info(id) {
+            b
         } else if let Some(tail) = self.class_tails.get(&id) {
             let mut b = ev::class_info_plain(id, desc_slot);
             b.extend_from_slice(tail);
@@ -266,7 +274,7 @@ impl Server {
     /// 0x6918 take damage (`BasePart_OnDamage`): hp −= hull factor × damage >> 8; at 0 the part
     /// explodes (0x1003 effect 3), joins the removed list and every client drops it (0x1126).
     /// Returns true if `root` is a starbase.
-    pub(super) fn damage_base_part(&mut self, root: u32, part: u16, d: &combat::Damage, shooter: u16) -> bool {
+    pub(super) fn damage_base_part(&mut self, root: u32, part: u16, d: &combat::Damage) -> bool {
         let debug = self.opts.debug_damage;
         let Some(b) = self.bases.get_mut(&root) else { return false };
         let Some(p) = b.parts.iter_mut().find(|p| p.index == part && p.alive) else { return true };
@@ -285,7 +293,7 @@ impl Server {
         if hp >= 1 {
             // `Weapon_PlayImpact(weapon, 0, 2, …)`: a small explosion at the hit, on top of the
             // hit report's own impact.
-            self.play_impact(d.weapon, 2, d.hit_pos, d.hit_pos, shooter);
+            self.play_impact(d.weapon, 2, 0xb, d.hit_pos, d.from.unwrap_or(d.hit_pos), d.hit_id, d.except);
             return true;
         }
         p.alive = false;

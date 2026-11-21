@@ -41,12 +41,19 @@ pub const WEAPON_POOL_MODELS: [(&str, &str); 13] = [
     ("mineshld.pak", "weapmine.pal"),
 ];
 
+/// The descriptor missiles use (`weapon_desc`, slot 0).
+pub const WEAPON_DESC: &str = "weapon_desc";
+
 impl Tables {
     pub fn new() -> Self {
         let mut t = Tables { models: vec![None; 256], descs: vec![None; 256], ..Default::default() };
         for (pak, pal) in WEAPON_POOL_MODELS {
             t.add_model(pak, pal);
         }
+        // `Weapons_Init` registers the weapon descriptor first, so every machine has it at
+        // descriptor slot 0; missiles name it in their class info.
+        t.descs[0] = Some(WEAPON_DESC.to_string());
+        t.desc_idx.insert(WEAPON_DESC.to_ascii_uppercase(), (0, None));
         t
     }
 
@@ -125,6 +132,8 @@ pub enum Owner {
     Player(u16),
     /// Placed from the SPX.
     Static,
+    /// A server-owned missile, torpedo or blast (`server/missiles.rs`).
+    Missile,
 }
 
 pub struct Entity {

@@ -48,25 +48,16 @@ pub struct Damage {
     /// The shooter's ship entity, if a player gets the credit.
     pub shooter: Option<u32>,
     pub kind: u8,
+    /// Where the shot came from (`Weapon_StageDamage` "from"): the missile's position for
+    /// server weapons; `None` for client hit reports, whose staged value is stale.
+    pub from: Option<[i32; 3]>,
+    /// The impact's hit id (0x1004 +0xc): the target for server weapons, 0 for hit reports.
+    pub hit_id: u32,
+    /// The connection the impacts exclude (the reporting shooter); `None` for server weapons.
+    pub except: Option<u16>,
 }
 
-/// The engine's `Math_Atan2(x, z)` (`Math_Atan2Core 0x4e0740`): 16.16 angle, 512 units per
-/// turn, with 0 toward −z, 128 toward −x, 256 toward +z and 384 toward +x. So the direction
-/// of angle a is −(sin a, cos a).
-pub fn engine_atan2(x: f64, z: f64) -> i32 {
-    if x == 0.0 && z == 0.0 {
-        return 0;
-    }
-    let t = (-x).atan2(-z);
-    ((t / std::f64::consts::TAU * 512.0 * 65536.0).round() as i64 as i32) & ANGLE_MASK
-}
-
-/// `Vec_DirAngles(a, b)`: yaw and pitch of a − b, roll 0.
-pub fn dir_angles(a: [i32; 3], b: [i32; 3]) -> [i32; 3] {
-    let d: [f64; 3] = std::array::from_fn(|k| (a[k] as f64 - b[k] as f64) / 2.0);
-    let xz = (d[0] * d[0] + d[2] * d[2]).sqrt();
-    [engine_atan2(d[0], d[2]), engine_atan2(d[1], -xz), 0]
-}
+pub use tachyon_core::math::{dir_angles, engine_atan2};
 
 /// `Shield_SplitFrontRear`: fold the bearing (0..512 units) to 0..256; rear share = dmg·b/256.
 /// Returns (front, rear).
@@ -137,10 +128,11 @@ fn power_change(a: &Power, b: &Power) -> String {
 
 impl Server {
     /// Who an entity is, for debug lines.
-    fn debug_name(&self, id: Option<u32>) -> String {
+    pub(super) fn debug_name(&self, id: Option<u32>) -> String {
         let Some(id) = id else { return "nobody".into() };
         match self.world.get(id).map(|e| e.owner) {
             Some(Owner::Player(s)) => self.conn(s).map_or(format!("{id:#x}"), |c| format!("{} (slot {s})", c.name)),
+            Some(Owner::Missile) => format!("{} {id:#x}", self.missiles.get(&id).and_then(|m| weapons::by_id(m.weapon)).map_or("missile", |w| w.name)),
             Some(Owner::Static) => format!("{} {id:#x}", self.world.get(id).map_or("?", |e| e.des.desc_type.as_str()).to_ascii_lowercase()),
             None => format!("{id:#x}"),
         }
@@ -153,7 +145,7 @@ impl Server {
     fn slot_of_ship(&self, id: u32) -> Option<u16> {
         match self.world.get(id)?.owner {
             Owner::Player(s) => Some(s),
-            Owner::Static => None,
+            Owner::Static | Owner::Missile => None,
         }
     }
 
@@ -212,6 +204,9 @@ impl Server {
             hit_pos: h.pos,
             shooter: Some(ship),
             kind: KILL_WEAPON,
+            from: None,
+            hit_id: 0,
+            except: Some(slot),
         };
         // The impact excludes the shooter, unless a surviving player victim took the hit, in
         // which case `TachSrv_DamagePlayer` re-staged the exclusion to the victim.
@@ -219,11 +214,11 @@ impl Server {
             None => self.damage_entity(h.target, &d).unwrap_or(slot),
             // `TachSrv_OnPartHitReport` → `CapShip_DamagePartById`.
             Some(part) => {
-                self.damage_base_part(h.target, part, &d, slot);
+                self.damage_base_part(h.target, part, &d);
                 slot
             }
         };
-        self.play_impact(h.weapon, h.kind, h.pos, target_pos, except);
+        self.play_impact(h.weapon, h.kind, 0, h.pos, target_pos, 0, Some(except));
     }
 
     /// The target's `+0x80` damage handler. Returns the connection a following impact should
@@ -237,6 +232,10 @@ impl Server {
                 None
             }
             Owner::Static => None,
+            Owner::Missile => {
+                self.damage_missile(id);
+                None
+            }
         }
     }
 
@@ -302,7 +301,7 @@ impl Server {
         if killed {
             self.ship_killed(id, d.shooter, d.kind);
         } else {
-            self.play_impact(d.weapon, result, d.hit_pos, target_pos, vslot);
+            self.play_impact(d.weapon, result, 0, d.hit_pos, d.from.unwrap_or(target_pos), d.hit_id, Some(vslot));
             except = Some(vslot);
         }
         self.queue(ev::EV_YOU_WERE_HIT, vec![0; 0x14], Delivery::only(vslot));
@@ -335,27 +334,27 @@ impl Server {
         self.remove_static(id);
     }
 
-    /// The weapon's impact callback on the server (`Impact_Bolt`): kind 1 (shield) sends the
-    /// spark 0x1004, anything else a small explosion 0x1003 effect 0. Collisions have none.
-    pub(super) fn play_impact(&mut self, weapon: u8, kind: u8, hit_pos: [i32; 3], target_pos: [i32; 3], except: u16) {
+    /// The weapon's impact callback on the server (`Impact_Bolt`, `Impact_Missile`): kind 1
+    /// (shield) sends the spark 0x1004, anything else an explosion 0x1003 with `effect` (0;
+    /// base parts pass 0xb). Collisions have none. `from` is the
+    /// staged source the spark's direction is taken from; `hit_id` the target for server
+    /// weapons. The projectile id is always 0 (`0x565408` is never written).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn play_impact(&mut self, weapon: u8, kind: u8, effect: u8, hit_pos: [i32; 3], from: [i32; 3], hit_id: u32, except: Option<u16>) {
         if weapon == WEAPON_COLLISION {
             return;
         }
+        let flags = D_RADIUS | D_QUADRANT | D_SYNCED | if except.is_some() { D_EXCEPT } else { 0 };
         if kind == 1 {
-            // The original's hit id, projectile id and direction come from stale staging
-            // globals (0 for hit reports); the direction here points from the hit to the
-            // target's centre.
-            let dir = dir_angles(target_pos, hit_pos);
-            self.queue(
-                ev::EV_IMPACT,
-                ev::impact(hit_pos, 0, 0, dir),
-                Delivery { budget: 4, flags: D_RADIUS | D_EXCEPT | D_QUADRANT | D_SYNCED, radius: 375 * FX as i64, pos: hit_pos, player: Some(except), team: 0 },
-            );
+            // For hit reports the original's direction comes from a stale staging global; here
+            // it points from the target's centre to the hit.
+            let dir = dir_angles(from, hit_pos);
+            self.queue(ev::EV_IMPACT, ev::impact(hit_pos, hit_id, 0, dir), Delivery { budget: 4, flags, radius: 375 * FX as i64, pos: hit_pos, player: except, team: 0 });
         } else {
             self.queue(
                 ev::EV_DESTROYED,
-                ev::destroyed(hit_pos, 0, 0, 0),
-                Delivery { budget: 4, flags: D_RADIUS | D_EXCEPT | D_QUADRANT | D_SYNCED, radius: EFFECT_RADIUS[0] * FX as i64, pos: hit_pos, player: Some(except), team: 0 },
+                ev::destroyed(hit_pos, 0, effect, 0),
+                Delivery { budget: 4, flags, radius: EFFECT_RADIUS[effect as usize] * FX as i64, pos: hit_pos, player: except, team: 0 },
             );
         }
     }
@@ -581,9 +580,9 @@ impl Server {
             // then clears the shooter and leaves the previous hit's factors and position staged,
             // so rams are never credited. DEVIATIONS.md "Ramming".
             let d = if original {
-                Damage { weapon: WEAPON_COLLISION, amount: dmg, shield_factor: 0x100, hull_factor: 0x100, hit_pos: my_pos, shooter: None, kind: KILL_RAMMED }
+                Damage { weapon: WEAPON_COLLISION, amount: dmg, shield_factor: 0x100, hull_factor: 0x100, hit_pos: my_pos, shooter: None, kind: KILL_RAMMED, from: None, hit_id: 0, except: None }
             } else {
-                Damage { weapon: WEAPON_COLLISION, amount: dmg, shield_factor: 0x100, hull_factor: 0x100, hit_pos: my_pos, shooter: Some(ship), kind: KILL_RAMMED }
+                Damage { weapon: WEAPON_COLLISION, amount: dmg, shield_factor: 0x100, hull_factor: 0x100, hit_pos: my_pos, shooter: Some(ship), kind: KILL_RAMMED, from: None, hit_id: 0, except: None }
             };
             self.damage_entity(other, &d);
         }

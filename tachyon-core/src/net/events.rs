@@ -15,6 +15,12 @@ pub const EV_ENTER_QUADRANT: u16 = 0x1007;
 pub const EV_DESPAWN: u16 = 0x1011;
 pub const EV_TELEPORT: u16 = 0x1012;
 pub const EV_ENTITY_OP: u16 = 0x1014;
+/// `SrvSend_MinePlaced`: a blast (or deployed weapon) appears: `vec3 pos, u16 weapon`.
+pub const EV_BLAST: u16 = 0x1008;
+/// `SrvSend_DecoyDropped`: `vec3 pos`.
+pub const EV_DECOY: u16 = 0x1104;
+/// 0x1014 op that removes an entity (`Proj_Remove`).
+pub const OP_REMOVE: u16 = 8;
 pub const EV_ROSTER_CLEARED: u16 = 0x1029;
 pub const EV_SESSION_BUMP: u16 = 0x1033;
 pub const EV_TEAM_SHIP: u16 = 0x1107;
@@ -98,6 +104,8 @@ pub const CL_QUADRANT_ENTERED: u16 = 0x2012;
 pub const CL_CHAT: u16 = 0x2022;
 pub const CL_PART_HIT: u16 = 0x2027;
 pub const CL_LOADOUT: u16 = 0x2028;
+/// `NetCli_SendCargoOp` (a misnomer): decoy dropped at `vec3 pos`.
+pub const CL_DECOY: u16 = 0x2020;
 
 /// Text colours (plain palette indices; `Gfx_DefineColor` stores `i` at `0x5a6320 + i`).
 pub const COLOR_CHAT: u16 = 0;
@@ -375,6 +383,85 @@ pub fn parse_power(b: &[u8]) -> (u16, u16) {
 /// 0x2009 `{u32 impactSpeed, u32 otherId}`.
 pub fn parse_collision(b: &[u8]) -> (i32, u32) {
     (i32_at(b, 0), u32_at(b, 4))
+}
+
+/// 0x2004 (`NetCli_SendFireGuided`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FireGuided {
+    /// The ship's position (16.16).
+    pub pos: [i32; 3],
+    /// 16.16 angles (sent as the high halves).
+    pub angles: [i32; 3],
+    /// Mount offset in ship space, f16 on the wire.
+    pub offset: [i32; 3],
+    pub client_frame: u32,
+    /// The lock target's server id, 0 if none.
+    pub target: u32,
+    pub weapon: u8,
+    pub volume: u8,
+    pub lock: u8,
+    pub slot: u8,
+}
+
+pub fn parse_fire_guided(b: &[u8]) -> FireGuided {
+    let i32_ = |o: usize| b.get(o..o + 4).map_or(0, |s| i32::from_le_bytes(s.try_into().unwrap()));
+    let u16_ = |o: usize| b.get(o..o + 2).map_or(0, |s| u16::from_le_bytes(s.try_into().unwrap()));
+    let u8_ = |o: usize| b.get(o).copied().unwrap_or(0);
+    FireGuided {
+        pos: [i32_(0), i32_(4), i32_(8)],
+        angles: [(u16_(0xc) as i32) << 16, (u16_(0xe) as i32) << 16, (u16_(0x10) as i32) << 16],
+        offset: [0, 1, 2].map(|k| crate::net::proto::f16_decode(u16_(0x12 + 2 * k))),
+        client_frame: i32_(0x18) as u32,
+        target: i32_(0x1c) as u32,
+        weapon: u8_(0x20),
+        volume: u8_(0x21),
+        lock: u8_(0x22),
+        slot: u8_(0x23),
+    }
+}
+
+pub fn fire_guided(f: &FireGuided) -> Vec<u8> {
+    let mut b = Vec::with_capacity(0x24);
+    for v in f.pos {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in f.angles {
+        b.extend_from_slice(&((v >> 16) as u16).to_le_bytes());
+    }
+    for v in f.offset {
+        b.extend_from_slice(&crate::net::proto::f16_encode(v).to_le_bytes());
+    }
+    b.extend_from_slice(&f.client_frame.to_le_bytes());
+    b.extend_from_slice(&f.target.to_le_bytes());
+    b.extend_from_slice(&[f.weapon, f.volume, f.lock, f.slot]);
+    b
+}
+
+/// A missile's class info (`WeaponDesc_WriteClassInfo`): `{id, descSlot, u32 targetId}`.
+pub fn class_info_missile(id: u32, desc_slot: u16, target: u32) -> Vec<u8> {
+    let mut b = class_info_plain(id, desc_slot);
+    b.extend_from_slice(&[0, 0]);
+    b.extend_from_slice(&target.to_le_bytes());
+    b
+}
+
+/// 0x1008 `{vec3 pos, u16 weapon}`.
+pub fn blast(pos: [i32; 3], weapon: u16) -> Vec<u8> {
+    let mut b = Vec::with_capacity(0xe);
+    for v in pos {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b.extend_from_slice(&weapon.to_le_bytes());
+    b
+}
+
+/// 0x1104 / 0x2020 `{vec3 pos}`.
+pub fn decoy(pos: [i32; 3]) -> Vec<u8> {
+    pos.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+pub fn parse_vec3(b: &[u8]) -> [i32; 3] {
+    std::array::from_fn(|k| b.get(4 * k..4 * k + 4).map_or(0, |s| i32::from_le_bytes(s.try_into().unwrap())))
 }
 
 pub fn collision(speed: i32, other: u32) -> Vec<u8> {

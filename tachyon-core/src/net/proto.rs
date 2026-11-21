@@ -145,6 +145,8 @@ pub struct Snapshot {
     pub records: Vec<Record>,
     pub page_list: u16,
     pub page_count: u16,
+    /// Status header one-shot flags (+0x14; bit 0 = a missile is homing on you).
+    pub one_shot_flags: u32,
 }
 
 /// GAMEDATA: 24-byte status header, then `u16 count, u16 pageList, u16 pageCount, vec3 origin`,
@@ -160,7 +162,7 @@ pub fn parse_gamedata(b: &[u8]) -> Option<Snapshot> {
         records.push(r);
         o += n;
     }
-    Some(Snapshot { records, page_list: u16_at(s, 2), page_count: u16_at(s, 4) })
+    Some(Snapshot { records, page_list: u16_at(s, 2), page_count: u16_at(s, 4), one_shot_flags: u32_at(b, 0x14) })
 }
 
 /// A startup blob: `u16 nRecs`, then `{u16 kind, u16 size, ...}`.

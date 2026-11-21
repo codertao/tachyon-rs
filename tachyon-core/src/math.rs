@@ -131,3 +131,22 @@ mod tests {
         }
     }
 }
+
+/// The engine's `Math_Atan2(x, z)` (`Math_Atan2Core 0x4e0740`): 16.16 angle, 512 units per
+/// turn, with 0 toward −z, 128 toward −x, 256 toward +z and 384 toward +x. So the direction
+/// of angle a is −(sin a, cos a).
+pub fn engine_atan2(x: f64, z: f64) -> i32 {
+    if x == 0.0 && z == 0.0 {
+        return 0;
+    }
+    let t = (-x).atan2(-z);
+    ((t / std::f64::consts::TAU * 512.0 * 65536.0).round() as i64 as i32) & 0x1ff_ffff
+}
+
+/// `Vec_DirAngles(a, b)`: yaw and pitch of a − b, roll 0.
+pub fn dir_angles(a: [i32; 3], b: [i32; 3]) -> [i32; 3] {
+    let d: [f64; 3] = std::array::from_fn(|k| (a[k] as f64 - b[k] as f64) / 2.0);
+    let xz = (d[0] * d[0] + d[2] * d[2]).sqrt();
+    [engine_atan2(d[0], d[2]), engine_atan2(d[1], -xz), 0]
+}
+

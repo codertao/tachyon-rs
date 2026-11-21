@@ -306,3 +306,47 @@ pub const AI_USAGE: [u32; 0x27] = [
 pub fn ai_usage(id: u8) -> u32 {
     AI_USAGE.get(id as usize).copied().unwrap_or(0)
 }
+
+/// Raw guided-weapon fields the server's missile simulation needs (`g_WeaponDefs`), in engine
+/// units: angles 16.16 with 512 units per turn, speeds 16.16 units per frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissileRaw {
+    pub id: u8,
+    /// def+0x84: launch phase index into `LAUNCH_FRAMES`.
+    pub guidance: u8,
+    /// def+0x88 / +0x8c: max turn per frame and its ramp per frame.
+    pub turn_max: i32,
+    pub turn_ramp: i32,
+    /// def+0x3c: life in frames after the launch phase.
+    pub life: u32,
+    /// def+0x54.
+    pub speed: i32,
+    /// def+0x9c: a blast's starting scale growth per frame.
+    pub blast_growth: i32,
+    /// def+0xd0: hit-test scale applied to the target's model (0 = the target's own +0xb8).
+    pub cast_scale: i32,
+    /// def+0xd8: bit 1 = a blast spares its shooter.
+    pub flags_d8: u32,
+}
+
+/// Launch-phase frames by guidance class (`0x55a51c`, stride 8): missiles 6, torpedoes 2,
+/// Helios 0.
+pub const LAUNCH_FRAMES: [u32; 3] = [6, 2, 0];
+
+pub const MISSILES: [MissileRaw; 10] = [
+    MissileRaw { id: 8, guidance: 1, turn_max: 0xa0000, turn_ramp: 0x2000, life: 400, speed: 0x38000, blast_growth: 0, cast_scale: 0x30000, flags_d8: 0 },
+    MissileRaw { id: 9, guidance: 1, turn_max: 0, turn_ramp: 0, life: 400, speed: 0x24000, blast_growth: 0xea60, cast_scale: 0x30000, flags_d8: 0 },
+    MissileRaw { id: 10, guidance: 1, turn_max: 0x180000, turn_ramp: 0x4000, life: 250, speed: 0x38000, blast_growth: 0xea60, cast_scale: 0x30000, flags_d8: 0 },
+    MissileRaw { id: 11, guidance: 1, turn_max: 0x120000, turn_ramp: 0x4000, life: 500, speed: 0x40000, blast_growth: 0xea60, cast_scale: 0x30000, flags_d8: 0 },
+    MissileRaw { id: 12, guidance: 0, turn_max: 0x200000, turn_ramp: 0x4000, life: 1500, speed: 0x3c350, blast_growth: 0, cast_scale: 0x30000, flags_d8: 0 },
+    MissileRaw { id: 13, guidance: 0, turn_max: 0x140000, turn_ramp: 0x8000, life: 1500, speed: 0x3c000, blast_growth: 0, cast_scale: 0x30000, flags_d8: 0 },
+    MissileRaw { id: 14, guidance: 0, turn_max: 0x100000, turn_ramp: 0x4000, life: 1500, speed: 0x29999, blast_growth: 0, cast_scale: 0x30000, flags_d8: 0 },
+    MissileRaw { id: 15, guidance: 0, turn_max: 0x100000, turn_ramp: 0x4000, life: 1000, speed: 0x44000, blast_growth: 0, cast_scale: 0x30000, flags_d8: 0 },
+    MissileRaw { id: 22, guidance: 2, turn_max: 0, turn_ramp: 0, life: 1500, speed: 0x14000, blast_growth: 0, cast_scale: 0, flags_d8: 0 },
+    MissileRaw { id: 33, guidance: 1, turn_max: 0, turn_ramp: 0, life: 1, speed: 0, blast_growth: 0x15f90, cast_scale: 0, flags_d8: 0 },
+];
+
+/// The guided (server-owned) weapons: those fired through 0x2004.
+pub fn missile(id: u8) -> Option<&'static MissileRaw> {
+    MISSILES.iter().find(|m| m.id == id)
+}
